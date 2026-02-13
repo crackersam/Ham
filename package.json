@@ -1,14 +1,15 @@
 {
-  "name": "ham",
+  "name": "ham-make-up-studio",
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "next dev --webpack",
+    "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.32",
     "next": "16.1.6",
     "react": "19.2.3",
     "react-dom": "19.2.3"

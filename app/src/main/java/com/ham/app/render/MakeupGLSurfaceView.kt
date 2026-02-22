@@ -1,21 +1,15 @@
 package com.ham.app.render
 
 import android.content.Context
-import android.graphics.SurfaceTexture
 import android.opengl.GLSurfaceView
 import android.util.AttributeSet
-import android.view.Surface
-import androidx.camera.core.Preview
-import androidx.core.content.ContextCompat
 
 /**
- * GLSurfaceView that owns the camera OES texture and the makeup GL renderer.
+ * GLSurfaceView that owns the makeup GL renderer.
  *
  * Key design decisions:
  *  - No alpha EGL config – we render opaque and don't need it; requesting
  *    alpha (8,8,8,8) causes EGLConfigChooser to throw on many devices.
- *  - Uses ContextCompat.getMainExecutor() instead of context.mainExecutor
- *    (the latter is API 28+, our minSdk is 26).
  */
 class MakeupGLSurfaceView @JvmOverloads constructor(
     context: Context,
@@ -31,23 +25,5 @@ class MakeupGLSurfaceView @JvmOverloads constructor(
         // across devices and is unnecessary since we render opaque.
         setRenderer(renderer)
         renderMode = RENDERMODE_WHEN_DIRTY
-    }
-
-    /**
-     * Returns a [Preview.SurfaceProvider] backed by the GL SurfaceTexture.
-     * Must only be called after [renderer.surfaceTexture] is non-null (i.e.,
-     * after [onSurfaceCreated] has fired on the GL thread).
-     */
-    fun buildSurfaceProvider(): Preview.SurfaceProvider = Preview.SurfaceProvider { request ->
-        val st = renderer.surfaceTexture ?: run {
-            request.willNotProvideSurface()
-            return@SurfaceProvider
-        }
-        val resolution = request.resolution
-        st.setDefaultBufferSize(resolution.width, resolution.height)
-        val surface = Surface(st)
-        request.provideSurface(surface, ContextCompat.getMainExecutor(context)) {
-            surface.release()
-        }
     }
 }

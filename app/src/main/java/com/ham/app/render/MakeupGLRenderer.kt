@@ -1,18 +1,16 @@
 package com.ham.app.render
 
 import android.content.Context
-import android.graphics.SurfaceTexture
-import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.util.Log
 import androidx.compose.ui.graphics.Color
 import com.ham.app.R
 import com.ham.app.data.*
-import com.ham.app.face.LandmarkPredictor
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
@@ -31,20 +29,25 @@ private const val STRIDE = 5 * FLOAT_SIZE   // position(2) + edgeFactor(1) + reg
  */
 class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
-    // ── Camera texture ────────────────────────────────────────────────────────
-    private var oesTextureId = 0
-    var surfaceTexture: SurfaceTexture? = null
-        private set
-    var onSurfaceTextureReady: ((SurfaceTexture) -> Unit)? = null
+    private data class FramePacket(
+        val rgba: ByteBuffer,
+        val width: Int,
+        val height: Int,
+        val landmarks: FloatArray?,
+    )
+
+    // ── Camera texture (GL_TEXTURE_2D fed from ImageAnalysis RGBA frames) ─────
+    private var camTextureId = 0
+    private var camTexWidth = 0
+    private var camTexHeight = 0
 
     // ── Camera shader ─────────────────────────────────────────────────────────
     private var camProg = 0
     private var camAPosition = 0
     private var camATexCoord = 0
-    private var camUTexTransform = 0
     private var camUMirror = 0
     private var camUTone = 0
-    private val texTransformMatrix = FloatArray(16)
+    private var camUTexture = 0
 
     // ── Foundation shader ─────────────────────────────────────────────────────
     // Draws the face-oval mesh sampling the OES camera texture so smoothing
@@ -53,7 +56,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var foundAPosition = 0
     private var foundAEdgeFactor = 0
     private var foundARegionUV = 0
-    private var foundUTexTransform = 0
+    private var foundUTexture = 0
     private var foundUTexelSize = 0
     private var foundUSmooth = 0
     private var foundUTone = 0
@@ -81,14 +84,6 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     /** Latest smoothed landmark array from MediaPipe – set from any thread. */
     val latestLandmarks = AtomicReference<FloatArray?>(null)
 
-    /**
-     * Velocity-based landmark predictor shared with [FaceLandmarkerHelper].
-     * When set, [onDrawFrame] calls [LandmarkPredictor.predict] with the
-     * current wall-clock time so every render frame uses an extrapolated
-     * position rather than a potentially stale snapshot.
-     */
-    var landmarkPredictor: LandmarkPredictor? = null
-
     /** Current makeup style – set from any thread. */
     var currentStyle: MakeupStyle = MAKEUP_STYLES[0]
 
@@ -108,12 +103,64 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     @Volatile var analysisWidth:  Float = 1f
     @Volatile var analysisHeight: Float = 1f
 
+    // ── Analysis-frame camera background (precise-lock path) ──────────────────
+    // CameraManager can push an RGBA frame buffer + landmarks as an atomic unit.
+    // The GL thread consumes the latest packet and uploads the RGBA bytes to a
+    // GL texture, ensuring makeup is drawn on the exact same frame used for
+    // landmark inference.
+    private val pendingFrame = AtomicReference<FramePacket?>(null)
+    private val rgbaPool = ArrayDeque<ByteBuffer>(2)
+    private var rgbaPoolAllocated = 0
+
+    /**
+     * Acquire a direct RGBA buffer (w*h*4 bytes). Returns null if no buffer is
+     * currently available (caller should drop the frame to avoid blocking).
+     */
+    @Synchronized
+    fun acquireRgbaBuffer(requiredBytes: Int): ByteBuffer? {
+        val it = rgbaPool.iterator()
+        while (it.hasNext()) {
+            val buf = it.next()
+            if (buf.capacity() >= requiredBytes) {
+                it.remove()
+                buf.clear()
+                return buf
+            }
+        }
+        if (rgbaPoolAllocated >= 2) return null
+        rgbaPoolAllocated++
+        return ByteBuffer.allocateDirect(requiredBytes).apply { order(ByteOrder.nativeOrder()); clear() }
+    }
+
+    @Synchronized
+    private fun releaseRgbaBuffer(buf: ByteBuffer) {
+        if (rgbaPool.size < 2) rgbaPool.addLast(buf)
+    }
+
+    /**
+     * Submit a new frame packet. If an older unconsumed packet exists, it is
+     * dropped and its buffer returned to the pool.
+     */
+    fun submitFrame(rgba: ByteBuffer, width: Int, height: Int, landmarks: FloatArray?) {
+        val old = pendingFrame.getAndSet(FramePacket(rgba, width, height, landmarks))
+        if (old != null) releaseRgbaBuffer(old.rgba)
+    }
+
     // ── Photo capture callback ────────────────────────────────────────────────
     var onPixelsReady: ((ByteArray, Int, Int) -> Unit)? = null
     private var captureNextFrame = false
 
     // ── Dynamic VBO for makeup ────────────────────────────────────────────────
     private var mkVbo = 0
+
+    // ── Shared geometry staging buffer ────────────────────────────────────────
+    // Pre-allocated once so drawGeometry() and drawFoundation() never call
+    // ByteBuffer.allocateDirect() on the GL thread, eliminating GC pressure
+    // that would otherwise cause micro-stutter (~20 allocations per frame).
+    // 64 KB covers the largest mesh with headroom to spare.
+    private val geomBuffer: ByteBuffer =
+        ByteBuffer.allocateDirect(65_536).apply { order(ByteOrder.nativeOrder()) }
+    private val geomFloatBuffer: FloatBuffer = geomBuffer.asFloatBuffer()
 
     // ─────────────────────────────────────────────────────────────────────────
     // GLSurfaceView.Renderer callbacks
@@ -122,20 +169,15 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) = runGLSafely("onSurfaceCreated") {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
 
-        // Create OES texture for camera
+        // Create 2D texture for camera frames (RGBA uploaded from ImageAnalysis)
         val texIds = IntArray(1)
         GLES20.glGenTextures(1, texIds, 0)
-        oesTextureId = texIds[0]
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-
-        // Create SurfaceTexture and notify host
-        val st = SurfaceTexture(oesTextureId)
-        surfaceTexture = st
-        onSurfaceTextureReady?.invoke(st)
+        camTextureId = texIds[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, camTextureId)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
         // Compile shaders
         val camVert = loadRawString(context, R.raw.camera_vertex)
@@ -143,9 +185,9 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         camProg = linkProgram(camVert, camFrag)
         camAPosition     = GLES20.glGetAttribLocation(camProg, "aPosition")
         camATexCoord     = GLES20.glGetAttribLocation(camProg, "aTexCoord")
-        camUTexTransform = GLES20.glGetUniformLocation(camProg, "uTexTransform")
         camUMirror       = GLES20.glGetUniformLocation(camProg, "uMirror")
         camUTone         = GLES20.glGetUniformLocation(camProg, "uTone")
+        camUTexture      = GLES20.glGetUniformLocation(camProg, "uTexture")
 
         val foundVert = loadRawString(context, R.raw.foundation_vertex)
         val foundFrag = loadRawString(context, R.raw.foundation_fragment)
@@ -153,7 +195,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         foundAPosition    = GLES20.glGetAttribLocation(foundProg,  "aPosition")
         foundAEdgeFactor  = GLES20.glGetAttribLocation(foundProg,  "aEdgeFactor")
         foundARegionUV    = GLES20.glGetAttribLocation(foundProg,  "aRegionUV")
-        foundUTexTransform = GLES20.glGetUniformLocation(foundProg, "uTexTransform")
+        foundUTexture     = GLES20.glGetUniformLocation(foundProg,  "uTexture")
         foundUTexelSize   = GLES20.glGetUniformLocation(foundProg,  "uTexelSize")
         foundUSmooth      = GLES20.glGetUniformLocation(foundProg,  "uSmooth")
         foundUTone        = GLES20.glGetUniformLocation(foundProg,  "uTone")
@@ -173,13 +215,10 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
         // Full-screen quad: position(xy) + texCoord(uv).
         //
-        // SurfaceTexture convention: the transform matrix it returns is designed
-        // for input tex-coords where Y=0 is at the TOP of the image and Y=1 is
-        // at the BOTTOM (Android / image-buffer origin), NOT the OpenGL origin
-        // (Y=0 at bottom).  Mapping the screen bottom-left to tex (0,1) and the
-        // screen top-left to tex (0,0) matches that convention; the transform
-        // then produces a right-side-up image.  Using (0,0) at screen-bottom
-        // (the OpenGL default) causes a double Y-flip → 180° rotation.
+        // Android bitmaps store rows top→bottom, but OpenGL texture coords
+        // conventionally treat v=0 as the bottom row.  Using v=1 at the screen
+        // bottom (and v=0 at the top) flips the image vertically so the camera
+        // background appears upright without having to vertically flip pixels.
         val quadData = floatArrayOf(
             // x     y     u     v
             -1f, -1f,  0f,  1f,   // screen bottom-left  → tex top-left
@@ -192,10 +231,14 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         quadVbo = vbos[0]
         mkVbo   = vbos[1]
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, quadVbo)
+        val quadBuf = ByteBuffer.allocateDirect(quadData.size * FLOAT_SIZE)
+            .apply { order(ByteOrder.nativeOrder()) }
+            .asFloatBuffer()
+            .apply { put(quadData); position(0) }
         GLES20.glBufferData(
             GLES20.GL_ARRAY_BUFFER,
             quadData.size * FLOAT_SIZE,
-            floatBuffer(quadData),
+            quadBuf,
             GLES20.GL_STATIC_DRAW,
         )
 
@@ -210,39 +253,48 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     override fun onDrawFrame(gl: GL10?) = runGLSafely("onDrawFrame") {
-        // Update camera texture
-        surfaceTexture?.updateTexImage()
-        surfaceTexture?.getTransformMatrix(texTransformMatrix)
+        // Consume the latest analysis frame (if any) and upload it to the 2D texture.
+        val packet = pendingFrame.getAndSet(null)
+        if (packet != null) {
+            uploadCameraTexture(packet)
+            latestLandmarks.set(packet.landmarks)
+            releaseRgbaBuffer(packet.rgba)
+        }
 
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
         // ── Pass 1: Camera ────────────────────────────────────────────────────
-        GLES20.glUseProgram(camProg)
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
+        if (camTexWidth > 0 && camTexHeight > 0) {
+            GLES20.glUseProgram(camProg)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, camTextureId)
 
-        GLES20.glUniformMatrix4fv(camUTexTransform, 1, false, texTransformMatrix, 0)
-        GLES20.glUniform1f(camUMirror, if (isMirrored) 1f else 0f)
-        GLES20.glUniform1f(camUTone, toneIntensity)
+            GLES20.glUniform1i(camUTexture, 0)
+            GLES20.glUniform1f(camUMirror, if (isMirrored) 1f else 0f)
+            GLES20.glUniform1f(camUTone, toneIntensity)
 
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, quadVbo)
-        val stride4 = 4 * FLOAT_SIZE
-        GLES20.glEnableVertexAttribArray(camAPosition)
-        GLES20.glVertexAttribPointer(camAPosition, 2, GLES20.GL_FLOAT, false, stride4, 0)
-        GLES20.glEnableVertexAttribArray(camATexCoord)
-        GLES20.glVertexAttribPointer(camATexCoord, 2, GLES20.GL_FLOAT, false, stride4, 2 * FLOAT_SIZE)
+            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, quadVbo)
+            val stride4 = 4 * FLOAT_SIZE
+            GLES20.glEnableVertexAttribArray(camAPosition)
+            GLES20.glVertexAttribPointer(camAPosition, 2, GLES20.GL_FLOAT, false, stride4, 0)
+            GLES20.glEnableVertexAttribArray(camATexCoord)
+            GLES20.glVertexAttribPointer(camATexCoord, 2, GLES20.GL_FLOAT, false, stride4, 2 * FLOAT_SIZE)
 
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        }
 
         // ── Pass 2: Makeup ────────────────────────────────────────────────────
         val style = currentStyle
-        val lm = landmarkPredictor?.predict(System.currentTimeMillis())
-            ?: latestLandmarks.get()
-        if (lm != null && style.lipAlpha > 0.001f || style.eyeshadowAlpha > 0.001f
-            || style.blushAlpha > 0.001f || style.linerAlpha > 0.001f) {
-            if (lm != null) {
-                drawMakeup(lm, style)
-            }
+        val lm = packet?.landmarks ?: latestLandmarks.get()
+        val hasAnyLayer =
+            style.foundationAlpha > 0.01f ||
+                style.blushAlpha > 0.01f ||
+                style.eyeshadowAlpha > 0.01f ||
+                style.linerAlpha > 0.01f ||
+                style.lipAlpha > 0.01f ||
+                style.highlightAlpha > 0.01f
+        if (lm != null && hasAnyLayer) {
+            drawMakeup(lm, style)
         }
 
         // ── Photo capture ─────────────────────────────────────────────────────
@@ -250,6 +302,43 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             captureNextFrame = false
             readPixels()
         }
+    }
+
+    private fun uploadCameraTexture(packet: FramePacket) {
+        // Upload RGBA to GL_TEXTURE_2D. We reuse the texture allocation when the
+        // frame size stays constant (normal case).
+        val w = packet.width
+        val h = packet.height
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, camTextureId)
+
+        if (w != camTexWidth || h != camTexHeight) {
+            camTexWidth = w
+            camTexHeight = h
+            GLES20.glTexImage2D(
+                GLES20.GL_TEXTURE_2D,
+                0,
+                GLES20.GL_RGBA,
+                w,
+                h,
+                0,
+                GLES20.GL_RGBA,
+                GLES20.GL_UNSIGNED_BYTE,
+                null,
+            )
+        }
+
+        packet.rgba.position(0)
+        GLES20.glTexSubImage2D(
+            GLES20.GL_TEXTURE_2D,
+            0,
+            0,
+            0,
+            w,
+            h,
+            GLES20.GL_RGBA,
+            GLES20.GL_UNSIGNED_BYTE,
+            packet.rgba,
+        )
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -271,16 +360,18 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
         // ── Foundation ────────────────────────────────────────────────────────
         // Drawn first so all subsequent makeup layers composite on top.
-        // Samples the OES camera texture within the face-oval mesh boundary,
+        // Samples the camera texture within the face-oval mesh boundary,
         // applying skin-smoothing and warmth correction only where the face is.
         if (style.foundationAlpha > 0.01f) {
             GLES20.glUseProgram(foundProg)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, camTextureId)
             GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
-            GLES20.glUniformMatrix4fv(foundUTexTransform, 1, false, texTransformMatrix, 0)
-            GLES20.glUniform2f(foundUTexelSize, 1f / viewWidth, 1f / viewHeight)
+            GLES20.glUniform1i(foundUTexture, 0)
+            val texW = if (camTexWidth > 0) camTexWidth else viewWidth
+            val texH = if (camTexHeight > 0) camTexHeight else viewHeight
+            GLES20.glUniform2f(foundUTexelSize, 1f / texW.toFloat(), 1f / texH.toFloat())
             GLES20.glUniform1f(foundUSmooth, smoothIntensity)
             GLES20.glUniform1f(foundUTone, toneIntensity)
             GLES20.glUniform1f(foundUFoundAlpha, style.foundationAlpha)
@@ -440,10 +531,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
      */
     private fun drawFoundation(verts: FloatArray) {
         if (verts.isEmpty()) return
-        val buf = floatBuffer(verts)
-
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, mkVbo)
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, verts.size * FLOAT_SIZE, buf, GLES20.GL_DYNAMIC_DRAW)
+        uploadGeometry(verts)
 
         GLES20.glEnableVertexAttribArray(foundAPosition)
         GLES20.glVertexAttribPointer(foundAPosition, 2, GLES20.GL_FLOAT, false, STRIDE, 0)
@@ -463,10 +551,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
     private fun drawGeometry(verts: FloatArray) {
         if (verts.isEmpty()) return
-        val buf = floatBuffer(verts)
-
-        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, mkVbo)
-        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, verts.size * FLOAT_SIZE, buf, GLES20.GL_DYNAMIC_DRAW)
+        uploadGeometry(verts)
 
         GLES20.glEnableVertexAttribArray(mkAPosition)
         GLES20.glVertexAttribPointer(mkAPosition, 2, GLES20.GL_FLOAT, false, STRIDE, 0)
@@ -478,6 +563,18 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES20.glVertexAttribPointer(mkARegionUV, 2, GLES20.GL_FLOAT, false, STRIDE, 3 * FLOAT_SIZE)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, verts.size / 5)
+    }
+
+    /** Copies [verts] into the pre-allocated staging buffer and uploads to [mkVbo]. */
+    private fun uploadGeometry(verts: FloatArray) {
+        geomFloatBuffer.clear()
+        geomFloatBuffer.put(verts)
+        geomBuffer.position(0).limit(verts.size * FLOAT_SIZE)
+
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, mkVbo)
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, verts.size * FLOAT_SIZE, geomBuffer, GLES20.GL_DYNAMIC_DRAW)
+
+        geomBuffer.limit(geomBuffer.capacity()) // restore limit for next use
     }
 
     private fun setMkColor(color: Color, alpha: Float) {
@@ -501,14 +598,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             c.alpha,
         )
 
-    private fun floatBuffer(data: FloatArray): FloatBuffer {
-        val bb = ByteBuffer.allocateDirect(data.size * FLOAT_SIZE)
-        bb.order(ByteOrder.nativeOrder())
-        val fb = bb.asFloatBuffer()
-        fb.put(data)
-        fb.position(0)
-        return fb
-    }
+
 
     // ─────────────────────────────────────────────────────────────────────────
     // Photo capture

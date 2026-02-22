@@ -11,17 +11,18 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.ham.app.face.FaceLandmarkerHelper
 import com.ham.app.render.MakeupGLSurfaceView
+import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 
 private const val TAG = "CameraManager"
 
 /**
- * Binds CameraX to the front camera with three use cases:
- *  - [Preview]: feeds the [MakeupGLSurfaceView] via its SurfaceTexture
- *  - [ImageAnalysis]: feeds [FaceLandmarkerHelper] for landmark detection
- *  - [ImageCapture]: available for still photo capture (JPEG)
+ * Binds CameraX to the front camera with:
+ *  - [ImageAnalysis]: feeds [FaceLandmarkerHelper] and the GL renderer from the same frames
+ *  - [ImageCapture]: (optional) available for still photo capture (JPEG)
  *
- * Call [bind] once the GL surface texture is ready.
+ * The on-screen camera background is rendered from ImageAnalysis RGBA frames
+ * uploaded to OpenGL, so we do not bind a CameraX Preview surface.
  */
 class CameraManager(private val context: Context) {
 
@@ -45,10 +46,6 @@ class CameraManager(private val context: Context) {
             val provider = providerFuture.get()
             cameraProvider = provider
 
-            val preview = Preview.Builder()
-                .setTargetResolution(Size(1280, 720))
-                .build()
-
             val capture = ImageCapture.Builder()
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                 .setTargetResolution(Size(1280, 720))
@@ -56,7 +53,14 @@ class CameraManager(private val context: Context) {
             imageCapture = capture
 
             val analysis = ImageAnalysis.Builder()
-                .setTargetResolution(Size(1280, 720))
+                // 640×360 (16:9) matches the preview aspect ratio so both
+                // use cases receive the same sensor crop from the camera HAL.
+                // A 4:3 target (e.g. 320×240) would give a different field of
+                // view than the 16:9 preview, making landmark y-positions
+                // systematically wrong relative to what appears on screen.
+                // MediaPipe internally resizes to 192×192, so 640×360 is
+                // still far smaller than the original 1280×720 analysis feed.
+                .setTargetResolution(Size(640, 360))
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
@@ -70,20 +74,7 @@ class CameraManager(private val context: Context) {
             try {
                 provider.unbindAll()
 
-                // Bind without a ViewPort so both the Preview OES texture and the
-                // ImageAnalysis frame cover the same full native camera frame.
-                // When a ViewPort is used, CameraX applies an additional software
-                // crop to ImageAnalysis (via cropRect) that is not reflected in the
-                // SurfaceTexture.getTransformMatrix() used by the GL renderer,
-                // causing the landmark coordinate space to diverge from the
-                // displayed camera image and making makeup appear larger and
-                // offset. Without ViewPort both use cases share the hardware's
-                // native sensor crop, keeping them in sync.
-                provider.bindToLifecycle(lifecycleOwner, selector, preview, capture, analysis)
-
-                // Connect preview to GL surface texture
-                val surfaceProvider = glSurfaceView.buildSurfaceProvider()
-                preview.setSurfaceProvider(surfaceProvider)
+                provider.bindToLifecycle(lifecycleOwner, selector, capture, analysis)
 
             } catch (e: Exception) {
                 Log.e(TAG, "CameraX bind failed", e)
@@ -129,11 +120,35 @@ class CameraManager(private val context: Context) {
                 it.analysisHeight = rotatedBitmap.height.toFloat()
             }
 
-            val ts = System.currentTimeMillis()
+            // Use the camera hardware capture timestamp (CLOCK_MONOTONIC ns → ms).
+            // This is the same clock used by SurfaceTexture.timestamp so the
+            // predictor's time base aligns perfectly with the displayed OES frame,
+            // removing any REALTIME/MONOTONIC clock conversion error.
+            val hwMs = imageProxy.imageInfo.timestamp / 1_000_000L
             // MediaPipe LIVE_STREAM requires strictly increasing timestamps.
-            if (ts > timestampMs) timestampMs = ts else timestampMs++
-            // detectLiveStream takes bitmap ownership and recycles it.
-            helper.detectLiveStream(rotatedBitmap, timestampMs)
+            if (hwMs > timestampMs) timestampMs = hwMs else timestampMs++
+            val landmarks = helper.detectForVideo(rotatedBitmap, timestampMs)
+
+            // Build an atomic per-frame packet for the renderer:
+            // - RGBA pixels for the camera background
+            // - Landmarks computed from the exact same pixels
+            val sv = glSurfaceView
+            val renderer = sv?.renderer
+            if (renderer != null) {
+                val w = rotatedBitmap.width
+                val h = rotatedBitmap.height
+                val bytes = w * h * 4
+                val rgba: ByteBuffer? = renderer.acquireRgbaBuffer(bytes)
+                if (rgba != null) {
+                    rgba.clear()
+                    rotatedBitmap.copyPixelsToBuffer(rgba)
+                    rgba.rewind()
+                    renderer.submitFrame(rgba, w, h, landmarks)
+                    sv.requestRender()
+                }
+            }
+
+            rotatedBitmap.recycle()
         } finally {
             imageProxy.close()
         }

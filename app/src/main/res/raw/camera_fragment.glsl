@@ -1,7 +1,6 @@
-#extension GL_OES_EGL_image_external : require
 precision mediump float;
 
-uniform samplerExternalOES uTexture;
+uniform sampler2D uTexture;
 varying vec2 vTexCoord;
 
 // Skin smoothing has moved to foundation_fragment.glsl so it is applied

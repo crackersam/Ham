@@ -17,15 +17,16 @@ private const val TAG = "FaceLandmarkerHelper"
 private const val NUM_LANDMARKS = 478
 
 /**
- * Wraps MediaPipe FaceLandmarker.
+ * Wraps MediaPipe FaceLandmarker in VIDEO mode (synchronous detection).
  *
- * Runs inference on a dedicated background thread and publishes smoothed
- * landmark results via [onResult]. Call [detectLiveStream] once per camera
- * frame from any thread.
+ * VIDEO mode is used instead of LIVE_STREAM because LIVE_STREAM applies an
+ * internal OneEuroFilter to landmark coordinates before firing the callback,
+ * adding ~1 camera frame (~33ms) of positional lag that cannot be corrected
+ * by our predictor.  VIDEO mode returns raw detection results synchronously
+ * with no inter-frame temporal smoothing, giving fresher, more accurate
+ * landmarks for the current frame.
  *
- * [modelPath] may be:
- *  - A bare filename like "face_landmarker.task" → loaded from assets
- *  - An absolute path → loaded from the filesystem (downloaded model)
+ * Call [detectForVideo] once per camera frame from the analysis thread.
  */
 class FaceLandmarkerHelper(
     private val context: Context,
@@ -33,18 +34,14 @@ class FaceLandmarkerHelper(
     val onResult: (FloatArray) -> Unit,
     val onError: (Exception) -> Unit,
 ) {
+    // Single-threaded executor serialises all access to the FaceLandmarker
+    // object (not thread-safe) and the setup/close lifecycle.
     private val executor = Executors.newSingleThreadExecutor()
-    private var landmarker: FaceLandmarker? = null
+    @Volatile private var landmarker: FaceLandmarker? = null
     private val setupStarted = AtomicBoolean(false)
 
-    private val kalman = LandmarkKalmanFilter(NUM_LANDMARKS)
-    private val motion = MotionDetector()
-
-    /** Latest smoothed landmark flat array [x0,y0,z0, x1,y1,z1 …], or null. */
+    /** Latest landmark flat array [x0,y0,z0, x1,y1,z1 …], or null. */
     val latestLandmarks = AtomicReference<FloatArray?>(null)
-
-    /** Extrapolates landmark positions at render frame rate between detections. */
-    val predictor = LandmarkPredictor(NUM_LANDMARKS)
 
     /**
      * Initialise the FaceLandmarker.  Safe to call multiple times – subsequent
@@ -62,9 +59,7 @@ class FaceLandmarkerHelper(
                     .setMinFaceDetectionConfidence(0.5f)
                     .setMinFacePresenceConfidence(0.5f)
                     .setMinTrackingConfidence(0.5f)
-                    .setRunningMode(RunningMode.LIVE_STREAM)
-                    .setResultListener { result, _ -> handleResult(result) }
-                    .setErrorListener { e -> onError(e) }
+                    .setRunningMode(RunningMode.VIDEO)
                     .build()
 
                 landmarker = FaceLandmarker.createFromOptions(context, options)
@@ -79,9 +74,7 @@ class FaceLandmarkerHelper(
                         .setMinFaceDetectionConfidence(0.5f)
                         .setMinFacePresenceConfidence(0.5f)
                         .setMinTrackingConfidence(0.5f)
-                        .setRunningMode(RunningMode.LIVE_STREAM)
-                        .setResultListener { result, _ -> handleResult(result) }
-                        .setErrorListener { err -> onError(err) }
+                        .setRunningMode(RunningMode.VIDEO)
                         .build()
 
                     landmarker = FaceLandmarker.createFromOptions(context, options)
@@ -94,43 +87,42 @@ class FaceLandmarkerHelper(
     }
 
     /**
-     * Submit a bitmap for async detection. Must be called with a timestamp
-     * that strictly increases each call (use [System.currentTimeMillis]).
+     * Submit a bitmap for synchronous detection.  [timestampMs] must strictly
+     * increase with each call (use the camera hardware timestamp).
      *
-     * The helper takes ownership of [bitmap] and recycles it after MediaPipe
-     * has read the pixel data, preventing a use-after-recycle race if the
-     * caller recycles it immediately on the analysis thread.
+     * Runs on the internal executor to serialise access to the FaceLandmarker.
+     * [detectForVideo] blocks until inference is complete, then immediately
+     * calls [handleResult] — no async callback queue, no internal smoothing.
+     *
+     * The caller owns [bitmap] and is responsible for recycling it.
      */
-    fun detectLiveStream(bitmap: Bitmap, timestampMs: Long) {
-        val lm = landmarker ?: run {
-            bitmap.recycle()
-            return
-        }
-        executor.execute {
-            try {
-                val mpImage = BitmapImageBuilder(bitmap).build()
-                // detectAsync reads pixel data synchronously before returning,
-                // so it is safe to recycle the bitmap afterwards.
-                lm.detectAsync(mpImage, timestampMs)
-            } catch (e: Exception) {
-                Log.w(TAG, "detectAsync error", e)
-            } finally {
-                if (!bitmap.isRecycled) bitmap.recycle()
-            }
+    fun detectForVideo(bitmap: Bitmap, timestampMs: Long): FloatArray? {
+        val lm = landmarker ?: return null
+        // Run directly on the calling thread (CameraManager's analysisExecutor).
+        // This keeps processFrame() blocked for the full inference duration so
+        // CameraX's KEEP_ONLY_LATEST drops intermediate frames naturally.
+        // The previous executor.execute{} wrapper returned immediately, causing
+        // every camera frame to be queued onto FaceLandmarkerHelper.executor —
+        // an unbounded queue that grew without bound and made lag dramatically
+        // worse as the predictor fell further and further behind.
+        return try {
+            val mpImage = BitmapImageBuilder(bitmap).build()
+            val result = lm.detectForVideo(mpImage, timestampMs)
+            handleResult(result, timestampMs)
+        } catch (e: Exception) {
+            Log.w(TAG, "detectForVideo error", e)
+            null
         }
     }
 
-    private fun handleResult(result: FaceLandmarkerResult) {
+    private fun handleResult(result: FaceLandmarkerResult, timestampMs: Long): FloatArray? {
         if (result.faceLandmarks().isEmpty()) {
             latestLandmarks.set(null)
-            motion.reset()
-            kalman.reset()
-            predictor.reset()
-            return
+            return null
         }
 
         val landmarks = result.faceLandmarks()[0]
-        if (landmarks.size < NUM_LANDMARKS) return
+        if (landmarks.size < NUM_LANDMARKS) return null
 
         val raw = FloatArray(NUM_LANDMARKS * 3)
         for (i in 0 until NUM_LANDMARKS) {
@@ -140,27 +132,16 @@ class FaceLandmarkerHelper(
             raw[i * 3 + 2] = lm.z()
         }
 
-        // Adaptive smoothing: less smoothing when face moves fast
-        val motionAmount = motion.detect(raw)
-        val smoothed = if (motionAmount > 0.5f) {
-            // Fast motion – skip Kalman for this frame to stay responsive
-            raw
-        } else {
-            kalman.filter(raw)
-        }
-
-        predictor.update(smoothed, System.currentTimeMillis())
-        latestLandmarks.set(smoothed)
-        onResult(smoothed)
+        latestLandmarks.set(raw)
+        onResult(raw)
+        return raw
     }
 
     private fun buildBaseOptions(delegate: Delegate): BaseOptions {
         val builder = BaseOptions.builder().setDelegate(delegate)
         return if (modelPath.startsWith("/")) {
-            // Absolute filesystem path (downloaded model cached in filesDir)
             builder.setModelAssetPath(modelPath).build()
         } else {
-            // Relative path → loaded from app assets
             builder.setModelAssetPath(modelPath).build()
         }
     }

@@ -65,12 +65,7 @@ fun CameraScreen(modelReady: Boolean) {
         FaceLandmarkerHelper(
             context = context,
             modelPath = app.modelPath(),
-            onResult = { lm ->
-                glSurfaceViewRef.value?.let { sv ->
-                    sv.renderer.latestLandmarks.set(lm)
-                    sv.requestRender()
-                }
-            },
+            onResult = { /* renderer is driven by CameraManager frame packets */ },
             onError = { e -> Log.e(TAG, "FaceLandmarker error", e) },
         )
     }
@@ -147,15 +142,10 @@ fun CameraScreen(modelReady: Boolean) {
                     // Set initial style
                     sv.renderer.currentStyle = MAKEUP_STYLES[selectedStyleIndex]
 
-                    // onSurfaceTextureReady is called from the GL thread;
                     // CameraX binding must happen on the main thread.
-                    sv.renderer.onSurfaceTextureReady = { st ->
-                        st.setOnFrameAvailableListener { sv.requestRender() }
-                        sv.renderer.landmarkPredictor = landmarkerHelper.predictor
-                        Handler(Looper.getMainLooper()).post {
-                            if (modelReady) landmarkerHelper.setup()
-                            cameraManager.bind(lifecycleOwner, sv, landmarkerHelper)
-                        }
+                    Handler(Looper.getMainLooper()).post {
+                        if (modelReady) landmarkerHelper.setup()
+                        cameraManager.bind(lifecycleOwner, sv, landmarkerHelper)
                     }
                 }
             },

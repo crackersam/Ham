@@ -1,7 +1,6 @@
-#extension GL_OES_EGL_image_external : require
 precision mediump float;
 
-uniform samplerExternalOES uTexture;
+uniform sampler2D uTexture;
 uniform vec2  uTexelSize;
 uniform float uSmooth;      // skin-smoothing intensity (renderer-level, 0–1)
 uniform float uTone;        // warmth intensity, kept in sync with camera shader

@@ -29,12 +29,19 @@ void main() {
     vec3 color = texture2D(uTexture, vCamUV).rgb;
     float luma  = dot(color, vec3(0.2126, 0.7152, 0.0722));
 
-    // Luminance-gated skin smoothing (avoids blurring dark brows/lashes)
+    // Luminance-gated, detail-preserving skin smoothing (avoids blurring brows/lashes)
     if (uSmooth > 0.01) {
-        vec3 blurred    = smoothSkin(vCamUV);
+        vec3 blurred = smoothSkin(vCamUV);
+
         float skinLikely = smoothstep(0.20, 0.45, luma)
                          * smoothstep(0.92, 0.65, luma);
-        color = mix(color, blurred, uSmooth * skinLikely * 0.80);
+
+        // Local-detail mask: if blur diverges from original, it's likely an edge/texture.
+        // Reduce smoothing there to keep features crisp (pro "skin" look instead of plastic).
+        float detail = length(color - blurred);               // ~0..0.3 typical
+        float keepDetail = 1.0 - smoothstep(0.03, 0.12, detail);
+
+        color = mix(color, blurred, uSmooth * skinLikely * keepDetail * 0.85);
         // Recalculate luma after smoothing for tone pass below
         luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
     }

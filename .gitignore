@@ -1,13 +1,55 @@
-*.iml
-.gradle
-/local.properties
-/.idea
+# macOS
 .DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+**/.DS_Store
+
+# IntelliJ / Android Studio
+*.iml
+*.ipr
+*.iws
+.idea/
+.run/
+out/
+
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Eclipse
+.classpath
+.project
+.settings/
+
+# Gradle / Kotlin
+.gradle/
+**/.gradle/
+.kotlin/
+.tmp_gradle/
+.gradle-dist/
+build/
+**/build/
+
+# Android build artifacts
+captures/
+**/captures/
+.externalNativeBuild/
+.cxx/
 *.apk
 *.aab
-/app/build/
-.tmp_gradle/
+*.ap_
+*.dex
+*.class
+*.hprof
+*.log
+
+# Local machine-specific config / secrets
+local.properties
+**/local.properties
+key.properties
+*.jks
+*.keystore
+
+# Local JDK/toolchain directories
+.jdk/

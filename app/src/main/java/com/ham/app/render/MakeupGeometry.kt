@@ -59,6 +59,58 @@ object MakeupGeometry {
     }
 
     /**
+     * Builds a feathered fan mesh from an unordered/contour-ish set of points by
+     * sorting them around the centroid. Useful for soft filled regions like brows.
+     */
+    fun buildSortedFanMesh(
+        lm: FloatArray,
+        indices: IntArray,
+        isMirrored: Boolean = true,
+        aspectScale: Float = 1f,
+    ): FloatArray {
+        val pts = indicesTo2D(lm, indices, isMirrored, aspectScale)
+        return buildSortedFanMesh2D(pts)
+    }
+
+    /**
+     * Like [buildSortedFanMesh] but takes explicit NDC points: [x0,y0,x1,y1,...].
+     */
+    fun buildSortedFanMesh2D(ndcPts: FloatArray): FloatArray {
+        val n = ndcPts.size / 2
+        if (n < 3) return FloatArray(0)
+
+        var cx = 0f; var cy = 0f
+        for (i in 0 until n) { cx += ndcPts[i * 2]; cy += ndcPts[i * 2 + 1] }
+        cx /= n.toFloat(); cy /= n.toFloat()
+
+        val order = (0 until n).sortedBy { i ->
+            val x = ndcPts[i * 2] - cx
+            val y = ndcPts[i * 2 + 1] - cy
+            Math.atan2(y.toDouble(), x.toDouble()).toFloat()
+        }
+
+        val verts = FloatArray(n * 3 * STRIDE)
+        var vi = 0
+        for (k in 0 until n) {
+            val i0 = order[k]
+            val i1 = order[(k + 1) % n]
+
+            // Center hub
+            verts[vi++] = cx; verts[vi++] = cy
+            verts[vi++] = 1f; verts[vi++] = 0.5f; verts[vi++] = 0.5f
+
+            // Edge i0
+            verts[vi++] = ndcPts[i0 * 2]; verts[vi++] = ndcPts[i0 * 2 + 1]
+            verts[vi++] = 0f; verts[vi++] = k.toFloat() / n.toFloat(); verts[vi++] = 0f
+
+            // Edge i1
+            verts[vi++] = ndcPts[i1 * 2]; verts[vi++] = ndcPts[i1 * 2 + 1]
+            verts[vi++] = 0f; verts[vi++] = (k + 1).toFloat() / n.toFloat(); verts[vi++] = 0f
+        }
+        return verts
+    }
+
+    /**
      * Builds a thickened stroke mesh for liner/eyebrow paths.
      * Each segment becomes a rectangle with soft inner edge (edgeFactor = 1)
      * and zero on the outside.
@@ -71,38 +123,298 @@ object MakeupGeometry {
         aspectScale: Float = 1f,
     ): FloatArray {
         val pts = indicesTo2D(lm, indices, isMirrored, aspectScale)
-        if (pts.size < 4) return FloatArray(0)  // need ≥ 2 points
+        return buildStrokeMesh2D(pts, widthNdc)
+    }
 
-        val n = pts.size / 2
+    /**
+     * Like [buildStrokeMesh], but takes an explicit polyline in NDC space:
+     * [x0, y0, x1, y1, ...].
+     *
+     * Produces a featherable stroke by building two strips per segment:
+     *   leftEdge (edgeFactor=0) ↔ centerLine (edgeFactor=1)
+     *   centerLine (edgeFactor=1) ↔ rightEdge (edgeFactor=0)
+     */
+    fun buildStrokeMesh2D(
+        ndcPts: FloatArray,
+        widthNdc: Float,
+    ): FloatArray {
+        if (ndcPts.size < 4) return FloatArray(0) // need ≥ 2 points
+
+        val n = ndcPts.size / 2
         val result = mutableListOf<Float>()
 
-        for (i in 0 until n - 1) {
-            val x0 = pts[i * 2]; val y0 = pts[i * 2 + 1]
-            val x1 = pts[(i + 1) * 2]; val y1 = pts[(i + 1) * 2 + 1]
+        fun addTri(ax: Float, ay: Float, aEf: Float,
+                   bx: Float, by: Float, bEf: Float,
+                   cx: Float, cy: Float, cEf: Float) {
+            // regionUV is currently unused for strokes, but keep stable values
+            result += floatArrayOf(ax, ay, aEf, 0f, 0f).toList()
+            result += floatArrayOf(bx, by, bEf, 0.5f, 0.5f).toList()
+            result += floatArrayOf(cx, cy, cEf, 1f, 1f).toList()
+        }
 
-            // Perpendicular direction
+        for (i in 0 until n - 1) {
+            val x0 = ndcPts[i * 2]; val y0 = ndcPts[i * 2 + 1]
+            val x1 = ndcPts[(i + 1) * 2]; val y1 = ndcPts[(i + 1) * 2 + 1]
+
             val dx = x1 - x0; val dy = y1 - y0
             val len = Math.sqrt((dx * dx + dy * dy).toDouble()).toFloat().coerceAtLeast(1e-6f)
             val nx = -dy / len * widthNdc
             val ny =  dx / len * widthNdc
 
-            // Four corners of the segment quad
-            val ax = x0 + nx; val ay = y0 + ny
-            val bx = x0 - nx; val by = y0 - ny
-            val cx = x1 + nx; val cy = y1 + ny
-            val dx2 = x1 - nx; val dy2 = y1 - ny
+            val l0x = x0 + nx; val l0y = y0 + ny
+            val r0x = x0 - nx; val r0y = y0 - ny
+            val l1x = x1 + nx; val l1y = y1 + ny
+            val r1x = x1 - nx; val r1y = y1 - ny
 
-            // Triangle 1: a, b, c
-            result += floatArrayOf(ax, ay, 0f, 0f, 0f).toList()
-            result += floatArrayOf(bx, by, 0f, 1f, 0f).toList()
-            result += floatArrayOf(cx, cy, 0f, 0f, 1f).toList()
-            // Triangle 2: b, dx2, c
-            result += floatArrayOf(bx, by, 0f, 1f, 0f).toList()
-            result += floatArrayOf(dx2, dy2, 0f, 1f, 1f).toList()
-            result += floatArrayOf(cx, cy, 0f, 0f, 1f).toList()
+            // Strip A: left edge -> centerline
+            // Tri 1: l0, c0, l1
+            addTri(l0x, l0y, 0f, x0, y0, 1f, l1x, l1y, 0f)
+            // Tri 2: c0, c1, l1
+            addTri(x0, y0, 1f, x1, y1, 1f, l1x, l1y, 0f)
+
+            // Strip B: centerline -> right edge
+            // Tri 3: c0, r0, c1
+            addTri(x0, y0, 1f, r0x, r0y, 0f, x1, y1, 1f)
+            // Tri 4: c1, r0, r1
+            addTri(x1, y1, 1f, r0x, r0y, 0f, r1x, r1y, 0f)
         }
 
         return result.toFloatArray()
+    }
+
+    // ── Brow fill mesh (ribbon) ──────────────────────────────────────────────
+
+    /**
+     * Builds a brow fill mesh as a "ribbon" between MediaPipe's two eyebrow
+     * contour polylines (5 points each, concatenated to 10 total).
+     *
+     * This avoids the centroid-fan triangulation used by [buildSortedFanMesh]
+     * which can self-intersect for eyebrow shapes and cause pigment spill
+     * below the underside edge.
+     *
+     * Feathering for a natural finish:
+     * - Underside edge is kept dense (edgeFactor ~= 1).
+     * - Upper edge fades out (edgeFactor = 0).
+     * - A mid ring keeps most of the brow volume opaque, with fade confined
+     *   to the upper portion.
+     */
+    fun buildBrowRibbonMesh(
+        lm: FloatArray,
+        browIndices: IntArray,
+        isMirrored: Boolean = true,
+        aspectScale: Float = 1f,
+        midT: Float = 0.35f,
+    ): FloatArray {
+        val half = browIndices.size / 2
+        if (half < 2 || browIndices.size < 4) return FloatArray(0)
+
+        val chainA = browIndices.copyOfRange(0, half)
+        val chainB = browIndices.copyOfRange(half, browIndices.size)
+
+        val a = indicesTo2D(lm, chainA, isMirrored, aspectScale)
+        val b = indicesTo2D(lm, chainB, isMirrored, aspectScale)
+        val n = minOf(a.size, b.size) / 2
+        if (n < 2) return FloatArray(0)
+
+        fun minY(pts: FloatArray): Float {
+            var mn = Float.POSITIVE_INFINITY
+            val m = pts.size / 2
+            for (i in 0 until m) {
+                val y = pts[i * 2 + 1]
+                if (y < mn) mn = y
+            }
+            return mn
+        }
+
+        // NDC y increases upward; the underside is the *lower* polyline.
+        val underside = if (minY(a) < minY(b)) a else b
+        val topSide   = if (underside === a) b else a
+
+        fun addV(
+            out: MutableList<Float>,
+            x: Float,
+            y: Float,
+            ef: Float,
+            u: Float,
+            v: Float,
+        ) {
+            out += floatArrayOf(x, y, ef, u, v).toList()
+        }
+
+        fun endFade(i: Int): Float {
+            // Keep ends slightly softer but never "off".
+            val t = if (n == 1) 0.5f else i.toFloat() / (n - 1).toFloat()
+            val bell = Math.sin((t * Math.PI).toDouble()).toFloat().coerceIn(0f, 1f) // 0→1→0
+            return (0.78f + 0.22f * bell).coerceIn(0f, 1f)
+        }
+
+        val tMid = midT.coerceIn(0.15f, 0.65f)
+        val out = mutableListOf<Float>()
+
+        for (i in 0 until n - 1) {
+            val next = i + 1
+
+            val u0 = i.toFloat() / (n - 1).toFloat()
+            val u1 = next.toFloat() / (n - 1).toFloat()
+
+            val b0x = underside[i * 2];       val b0y = underside[i * 2 + 1]
+            val b1x = underside[next * 2];    val b1y = underside[next * 2 + 1]
+            val t0x = topSide[i * 2];         val t0y = topSide[i * 2 + 1]
+            val t1x = topSide[next * 2];      val t1y = topSide[next * 2 + 1]
+
+            // Mid ring: keeps brow volume opaque; fade is concentrated above it.
+            val m0x = b0x + (t0x - b0x) * tMid
+            val m0y = b0y + (t0y - b0y) * tMid
+            val m1x = b1x + (t1x - b1x) * tMid
+            val m1y = b1y + (t1y - b1y) * tMid
+
+            val ef0 = endFade(i)
+            val ef1 = endFade(next)
+
+            // Strip 1: underside (v=0) -> mid (v=0.5), both dense
+            // Tri 1: b0, b1, m0
+            addV(out, b0x, b0y, ef0, u0, 0f)
+            addV(out, b1x, b1y, ef1, u1, 0f)
+            addV(out, m0x, m0y, ef0, u0, 0.5f)
+            // Tri 2: m0, b1, m1
+            addV(out, m0x, m0y, ef0, u0, 0.5f)
+            addV(out, b1x, b1y, ef1, u1, 0f)
+            addV(out, m1x, m1y, ef1, u1, 0.5f)
+
+            // Strip 2: mid (dense) -> top (fade out)
+            // Tri 3: m0, m1, t0
+            addV(out, m0x, m0y, ef0, u0, 0.5f)
+            addV(out, m1x, m1y, ef1, u1, 0.5f)
+            addV(out, t0x, t0y, 0f,  u0, 1f)
+            // Tri 4: t0, m1, t1
+            addV(out, t0x, t0y, 0f,  u0, 1f)
+            addV(out, m1x, m1y, ef1, u1, 0.5f)
+            addV(out, t1x, t1y, 0f,  u1, 1f)
+        }
+
+        return out.toFloatArray()
+    }
+
+    /**
+     * Returns the underside brow polyline (inner→outer) in NDC space.
+     * Intended for the definition stroke so the crisp line follows the
+     * underside boundary rather than a centroid-derived spine.
+     */
+    fun buildBrowUndersidePath2D(
+        lm: FloatArray,
+        browIndices: IntArray,
+        isMirrored: Boolean = true,
+        aspectScale: Float = 1f,
+        targetPoints: Int = 7,
+    ): FloatArray {
+        val half = browIndices.size / 2
+        if (half < 2 || browIndices.size < 4) return FloatArray(0)
+        val chainA = browIndices.copyOfRange(0, half)
+        val chainB = browIndices.copyOfRange(half, browIndices.size)
+        val a = indicesTo2D(lm, chainA, isMirrored, aspectScale)
+        val b = indicesTo2D(lm, chainB, isMirrored, aspectScale)
+        val n = minOf(a.size, b.size) / 2
+        if (n < 2) return FloatArray(0)
+
+        fun minY(pts: FloatArray): Float {
+            var mn = Float.POSITIVE_INFINITY
+            val m = pts.size / 2
+            for (i in 0 until m) {
+                val y = pts[i * 2 + 1]
+                if (y < mn) mn = y
+            }
+            return mn
+        }
+        val underside = if (minY(a) < minY(b)) a else b
+
+        // Smooth with a simple 3-point moving average.
+        val sm = FloatArray(n * 2)
+        for (i in 0 until n) {
+            val i0 = (i - 1).coerceAtLeast(0)
+            val i1 = i
+            val i2 = (i + 1).coerceAtMost(n - 1)
+            sm[i * 2]     = (underside[i0 * 2]     + underside[i1 * 2]     + underside[i2 * 2])     / 3f
+            sm[i * 2 + 1] = (underside[i0 * 2 + 1] + underside[i1 * 2 + 1] + underside[i2 * 2 + 1]) / 3f
+        }
+
+        val outCount = targetPoints.coerceIn(2, n)
+        val out = FloatArray(outCount * 2)
+        for (k in 0 until outCount) {
+            val idx = ((k.toFloat() / (outCount - 1).toFloat()) * (n - 1).toFloat()).toInt()
+            out[k * 2]     = sm[idx * 2]
+            out[k * 2 + 1] = sm[idx * 2 + 1]
+        }
+        return out
+    }
+
+    /**
+     * Derive a single brow spine polyline (inner→outer) from the brow landmark
+     * set. Intended for ONE subtle definition stroke (not a contour trace).
+     *
+     * Returns NDC points: [x0,y0,x1,y1,...].
+     */
+    fun buildBrowSpine2D(
+        lm: FloatArray,
+        browIndices: IntArray,
+        isMirrored: Boolean = true,
+        aspectScale: Float = 1f,
+        noseIdx: Int = LandmarkIndex.NOSE_TIP,
+        targetPoints: Int = 7,
+    ): FloatArray {
+        val pts = indicesTo2D(lm, browIndices, isMirrored, aspectScale)
+        val n = pts.size / 2
+        if (n < 2) return FloatArray(0)
+
+        val noseX = lmX(lm, noseIdx, isMirrored, aspectScale)
+
+        // Find inner/outer endpoints based on distance from the nose.
+        var innerI = 0
+        var outerI = 0
+        var minD = Float.MAX_VALUE
+        var maxD = -Float.MAX_VALUE
+        for (i in 0 until n) {
+            val d = kotlin.math.abs(pts[i * 2] - noseX)
+            if (d < minD) { minD = d; innerI = i }
+            if (d > maxD) { maxD = d; outerI = i }
+        }
+
+        val ix = pts[innerI * 2]; val iy = pts[innerI * 2 + 1]
+        val ox = pts[outerI * 2]; val oy = pts[outerI * 2 + 1]
+
+        var dirX = ox - ix
+        var dirY = oy - iy
+        val dirLen = Math.sqrt((dirX * dirX + dirY * dirY).toDouble()).toFloat().coerceAtLeast(1e-6f)
+        dirX /= dirLen; dirY /= dirLen
+
+        data class P(val x: Float, val y: Float, val t: Float)
+        val ordered = ArrayList<P>(n)
+        for (i in 0 until n) {
+            val px = pts[i * 2]; val py = pts[i * 2 + 1]
+            val t = (px - ix) * dirX + (py - iy) * dirY
+            ordered.add(P(px, py, t))
+        }
+        ordered.sortBy { it.t }
+
+        // Smooth with a simple 3-point moving average.
+        val sm = ArrayList<P>(ordered.size)
+        for (i in ordered.indices) {
+            val p0 = ordered[(i - 1).coerceAtLeast(0)]
+            val p1 = ordered[i]
+            val p2 = ordered[(i + 1).coerceAtMost(ordered.lastIndex)]
+            val sx = (p0.x + p1.x + p2.x) / 3f
+            val sy = (p0.y + p1.y + p2.y) / 3f
+            sm.add(P(sx, sy, p1.t))
+        }
+
+        // Downsample uniformly to targetPoints, preserving endpoints.
+        val outCount = targetPoints.coerceIn(2, sm.size)
+        val out = FloatArray(outCount * 2)
+        for (k in 0 until outCount) {
+            val idx = ((k.toFloat() / (outCount - 1).toFloat()) * (sm.size - 1).toFloat()).toInt()
+            out[k * 2] = sm[idx].x
+            out[k * 2 + 1] = sm[idx].y
+        }
+        return out
     }
 
     /**
@@ -125,15 +437,102 @@ object MakeupGeometry {
             verts[vi++] = centerX; verts[vi++] = centerY
             verts[vi++] = 1f; verts[vi++] = 0.5f; verts[vi++] = 0.5f
             // Edge vertex i
-            verts[vi++] = centerX + Math.cos(a0.toDouble()).toFloat() * radiusX
-            verts[vi++] = centerY + Math.sin(a0.toDouble()).toFloat() * radiusY
-            verts[vi++] = 0f; verts[vi++] = 0f; verts[vi++] = 0f
+            val c0 = Math.cos(a0.toDouble()).toFloat()
+            val s0 = Math.sin(a0.toDouble()).toFloat()
+            verts[vi++] = centerX + c0 * radiusX
+            verts[vi++] = centerY + s0 * radiusY
+            // Radial UV: maps rim to the unit circle around (0.5, 0.5).
+            verts[vi++] = 0f; verts[vi++] = 0.5f + 0.5f * c0; verts[vi++] = 0.5f + 0.5f * s0
             // Edge vertex i+1
-            verts[vi++] = centerX + Math.cos(a1.toDouble()).toFloat() * radiusX
-            verts[vi++] = centerY + Math.sin(a1.toDouble()).toFloat() * radiusY
-            verts[vi++] = 0f; verts[vi++] = 1f; verts[vi++] = 0f
+            val c1 = Math.cos(a1.toDouble()).toFloat()
+            val s1 = Math.sin(a1.toDouble()).toFloat()
+            verts[vi++] = centerX + c1 * radiusX
+            verts[vi++] = centerY + s1 * radiusY
+            verts[vi++] = 0f; verts[vi++] = 0.5f + 0.5f * c1; verts[vi++] = 0.5f + 0.5f * s1
         }
         return verts
+    }
+
+    // ── Lash mesh ────────────────────────────────────────────────────────────
+
+    /**
+     * Builds a natural-looking upper-lash mesh: small tapered spikes along the
+     * upper lash line, pointing outward from the eye center.
+     *
+     * Uses triangle spikes with edgeFactor=1 at the base and 0 at the tip so
+     * the shader tapers them naturally.
+     */
+    fun buildUpperLashesMesh(
+        lm: FloatArray,
+        upperLinerIndices: IntArray,
+        isMirrored: Boolean = true,
+        lengthNdc: Float,
+        thicknessNdc: Float,
+        aspectScale: Float = 1f,
+        subdivisionsPerSegment: Int = 3,
+    ): FloatArray {
+        val arc = indicesTo2D(lm, upperLinerIndices, isMirrored, aspectScale)
+        val n = arc.size / 2
+        if (n < 2) return FloatArray(0)
+
+        // Eye center as mean of arc points.
+        var cx = 0f; var cy = 0f
+        for (i in 0 until n) { cx += arc[i * 2]; cy += arc[i * 2 + 1] }
+        cx /= n.toFloat(); cy /= n.toFloat()
+
+        val segCount = n - 1
+        val subs = subdivisionsPerSegment.coerceIn(1, 6)
+
+        val result = mutableListOf<Float>()
+
+        fun addV(x: Float, y: Float, ef: Float) {
+            // Keep regionUV stable; not used for lashes.
+            result += floatArrayOf(x, y, ef, 0.5f, 0.5f).toList()
+        }
+
+        for (si in 0 until segCount) {
+            val x0 = arc[si * 2];     val y0 = arc[si * 2 + 1]
+            val x1 = arc[(si + 1) * 2]; val y1 = arc[(si + 1) * 2 + 1]
+
+            var tx = x1 - x0
+            var ty = y1 - y0
+            val tLen = Math.sqrt((tx * tx + ty * ty).toDouble()).toFloat().coerceAtLeast(1e-6f)
+            tx /= tLen; ty /= tLen
+
+            for (s in 0 until subs) {
+                val t = (s.toFloat() + 0.5f) / subs.toFloat()
+                val px = x0 + (x1 - x0) * t
+                val py = y0 + (y1 - y0) * t
+
+                // Normalized position along lid for bell-curve lash length.
+                val u = (si.toFloat() + t) / segCount.toFloat()
+                val bell = Math.sin((u * Math.PI).toDouble()).toFloat().coerceIn(0f, 1f)
+                val lashLen = lengthNdc * (0.35f + 0.65f * bell)
+
+                // Point lashes outward from eye center.
+                var dx = px - cx
+                var dy = py - cy
+                val dLen = Math.sqrt((dx * dx + dy * dy).toDouble()).toFloat().coerceAtLeast(1e-6f)
+                dx /= dLen; dy /= dLen
+
+                val tipX = px + dx * lashLen
+                val tipY = py + dy * lashLen
+
+                val baseHalf = thicknessNdc * (0.75f + 0.45f * bell)
+                val b0x = px - tx * baseHalf
+                val b0y = py - ty * baseHalf
+                val b1x = px + tx * baseHalf
+                val b1y = py + ty * baseHalf
+
+                // Triangle: base0, base1, tip
+                // Strong at base (ef=1), feather to tip (ef=0).
+                addV(b0x, b0y, 1f)
+                addV(b1x, b1y, 1f)
+                addV(tipX, tipY, 0f)
+            }
+        }
+
+        return result.toFloatArray()
     }
 
     // ── Upper-eyelid strip mesh ──────────────────────────────────────────────

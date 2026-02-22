@@ -12,6 +12,9 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.floor
+import kotlin.math.min
+import kotlin.math.sqrt
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
@@ -72,6 +75,12 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var mkUColor2 = 0
     private var mkUBlendMode = 0
     private var mkUGradientDir = 0
+    private var mkUEffectKind = 0
+    private var mkUNoiseTex = 0
+    private var mkUNoiseScale = 0
+    private var mkUNoiseAmount = 0
+
+    private var noiseTextureId = 0
 
     // ── Quad VBO ──────────────────────────────────────────────────────────────
     private var quadVbo = 0
@@ -212,6 +221,10 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         mkUColor2    = GLES20.glGetUniformLocation(mkProg, "uColor2")
         mkUBlendMode = GLES20.glGetUniformLocation(mkProg, "uBlendMode")
         mkUGradientDir = GLES20.glGetUniformLocation(mkProg, "uGradientDir")
+        mkUEffectKind = GLES20.glGetUniformLocation(mkProg, "uEffectKind")
+        mkUNoiseTex = GLES20.glGetUniformLocation(mkProg, "uNoiseTex")
+        mkUNoiseScale = GLES20.glGetUniformLocation(mkProg, "uNoiseScale")
+        mkUNoiseAmount = GLES20.glGetUniformLocation(mkProg, "uNoiseAmount")
 
         // Full-screen quad: position(xy) + texCoord(uv).
         //
@@ -244,6 +257,9 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+
+        // Small repeatable noise texture for blush grain (generated once).
+        noiseTextureId = createNoiseTexture(size = 64, seed = 1337)
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) = runGLSafely("onSurfaceChanged") {
@@ -292,7 +308,10 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 style.eyeshadowAlpha > 0.01f ||
                 style.linerAlpha > 0.01f ||
                 style.lipAlpha > 0.01f ||
-                style.highlightAlpha > 0.01f
+                style.highlightAlpha > 0.01f ||
+                style.browAlpha > 0.01f ||
+                style.browFillAlpha > 0.01f ||
+                style.lashAlpha > 0.01f
         if (lm != null && hasAnyLayer) {
             drawMakeup(lm, style)
         }
@@ -382,28 +401,113 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
         GLES20.glUseProgram(mkProg)
 
+        // Bind grain noise texture (used only for blush; uniforms default to disabled).
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, noiseTextureId)
+        GLES20.glUniform1i(mkUNoiseTex, 1)
+        GLES20.glUniform1f(mkUNoiseScale, 12.0f)
+        GLES20.glUniform1f(mkUNoiseAmount, 0f)
+        GLES20.glUniform1f(mkUEffectKind, 0f)
+
+        // ── Brows ─────────────────────────────────────────────────────────────
+        if (style.browAlpha > 0.01f || style.browFillAlpha > 0.01f) {
+            GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+            GLES20.glUniform1f(mkUBlendMode, 1f)  // multiply-like for brow shading
+            GLES20.glUniform1f(mkUGradientDir, 0f)
+
+            val eyeH =
+                (MakeupGeometry.eyeHeight(lm, LEFT_UPPER_LID_ARC,  LandmarkIndex.LEFT_EYE_LOWER,  mirror, aspectScale) +
+                 MakeupGeometry.eyeHeight(lm, RIGHT_UPPER_LID_ARC, LandmarkIndex.RIGHT_EYE_LOWER, mirror, aspectScale)) * 0.5f
+
+            // Pass A: soft powder-like fill
+            if (style.browFillAlpha > 0.01f) {
+                setMkColor(style.browColor, style.browFillAlpha)
+                // Use a ribbon mesh between the two eyebrow contours to prevent
+                // triangle fan spill below the underside edge.
+                drawGeometry(MakeupGeometry.buildBrowRibbonMesh(lm, LEFT_BROW, mirror, aspectScale))
+                drawGeometry(MakeupGeometry.buildBrowRibbonMesh(lm, RIGHT_BROW, mirror, aspectScale))
+            }
+
+            // Pass B: defined shaping
+            if (style.browAlpha > 0.01f) {
+                val defW = (eyeH * 0.06f).coerceIn(0.0025f, 0.012f)
+                setMkColor(style.browColor, style.browAlpha)
+                drawGeometry(
+                    MakeupGeometry.buildStrokeMesh2D(
+                        // Track the underside contour for a cleaner lower edge.
+                        MakeupGeometry.buildBrowUndersidePath2D(lm, LEFT_BROW, mirror, aspectScale),
+                        defW
+                    )
+                )
+                drawGeometry(
+                    MakeupGeometry.buildStrokeMesh2D(
+                        MakeupGeometry.buildBrowUndersidePath2D(lm, RIGHT_BROW, mirror, aspectScale),
+                        defW
+                    )
+                )
+            }
+        }
+
         // ── Blush ─────────────────────────────────────────────────────────────
         if (style.blushAlpha > 0.01f) {
             GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
-            val lCx = MakeupGeometry.lmX(lm, LandmarkIndex.LEFT_CHEEK_CENTER, mirror, aspectScale)
-            val lCy = MakeupGeometry.lmY(lm, LandmarkIndex.LEFT_CHEEK_CENTER)
-            val rCx = MakeupGeometry.lmX(lm, LandmarkIndex.RIGHT_CHEEK_CENTER, mirror, aspectScale)
-            val rCy = MakeupGeometry.lmY(lm, LandmarkIndex.RIGHT_CHEEK_CENTER)
+            val lCx0 = MakeupGeometry.lmX(lm, LandmarkIndex.LEFT_CHEEK_CENTER, mirror, aspectScale)
+            val lCy0 = MakeupGeometry.lmY(lm, LandmarkIndex.LEFT_CHEEK_CENTER)
+            val rCx0 = MakeupGeometry.lmX(lm, LandmarkIndex.RIGHT_CHEEK_CENTER, mirror, aspectScale)
+            val rCy0 = MakeupGeometry.lmY(lm, LandmarkIndex.RIGHT_CHEEK_CENTER)
 
             // Radii derived from the actual bounding extent of each cheek's landmarks.
             val (lRx, lRy) = MakeupGeometry.landmarkBoundingRadius(lm, LEFT_CHEEK, mirror, aspectScale)
             val (rRx, rRy) = MakeupGeometry.landmarkBoundingRadius(lm, RIGHT_CHEEK, mirror, aspectScale)
 
+            // Bias slightly up/out along the cheekbone direction (lip corner -> outer eye).
+            val lEx = MakeupGeometry.lmX(lm, LandmarkIndex.LEFT_EYE_OUTER, mirror, aspectScale)
+            val lEy = MakeupGeometry.lmY(lm, LandmarkIndex.LEFT_EYE_OUTER)
+            val lMx = MakeupGeometry.lmX(lm, LandmarkIndex.LIP_LEFT, mirror, aspectScale)
+            val lMy = MakeupGeometry.lmY(lm, LandmarkIndex.LIP_LEFT)
+            val rEx = MakeupGeometry.lmX(lm, LandmarkIndex.RIGHT_EYE_OUTER, mirror, aspectScale)
+            val rEy = MakeupGeometry.lmY(lm, LandmarkIndex.RIGHT_EYE_OUTER)
+            val rMx = MakeupGeometry.lmX(lm, LandmarkIndex.LIP_RIGHT, mirror, aspectScale)
+            val rMy = MakeupGeometry.lmY(lm, LandmarkIndex.LIP_RIGHT)
+
+            fun biasedCenter(
+                cx: Float,
+                cy: Float,
+                ex: Float,
+                ey: Float,
+                mx: Float,
+                my: Float,
+                rx: Float,
+                ry: Float,
+            ): Pair<Float, Float> {
+                var dx = ex - mx
+                var dy = ey - my
+                val d = sqrt(dx * dx + dy * dy).coerceAtLeast(1e-6f)
+                dx /= d; dy /= d
+                val shift = 0.18f * min(rx, ry)
+                return Pair(cx + dx * shift, cy + dy * shift)
+            }
+
+            val (lCx, lCy) = biasedCenter(lCx0, lCy0, lEx, lEy, lMx, lMy, lRx, lRy)
+            val (rCx, rCy) = biasedCenter(rCx0, rCy0, rEx, rEy, rMx, rMy, rRx, rRy)
+
             GLES20.glUniform1f(mkUBlendMode, 0f)
             GLES20.glUniform1f(mkUGradientDir, 0f)
-            setMkColor(style.blushColor, style.blushAlpha * 0.7f)
-            drawGeometry(MakeupGeometry.buildBlushMesh(lCx, lCy, lRx, lRy))
-            drawGeometry(MakeupGeometry.buildBlushMesh(rCx, rCy, rRx, rRy))
+            GLES20.glUniform1f(mkUEffectKind, 1f)
+            GLES20.glUniform1f(mkUNoiseAmount, 0.12f)
+
+            setMkColor(style.blushColor, style.blushAlpha * 0.55f)
+            drawGeometry(MakeupGeometry.buildBlushMesh(lCx, lCy, lRx, lRy, segments = 40))
+            drawGeometry(MakeupGeometry.buildBlushMesh(rCx, rCy, rRx, rRy, segments = 40))
 
             // Second softer pass for depth
-            setMkColor(style.blushColor, style.blushAlpha * 0.35f)
-            drawGeometry(MakeupGeometry.buildBlushMesh(lCx, lCy, lRx * 1.2f, lRy * 1.2f))
-            drawGeometry(MakeupGeometry.buildBlushMesh(rCx, rCy, rRx * 1.2f, rRy * 1.2f))
+            setMkColor(style.blushColor, style.blushAlpha * 0.24f)
+            drawGeometry(MakeupGeometry.buildBlushMesh(lCx, lCy, lRx * 1.35f, lRy * 1.30f, segments = 40))
+            drawGeometry(MakeupGeometry.buildBlushMesh(rCx, rCy, rRx * 1.35f, rRy * 1.30f, segments = 40))
+
+            // Reset defaults for subsequent layers.
+            GLES20.glUniform1f(mkUEffectKind, 0f)
+            GLES20.glUniform1f(mkUNoiseAmount, 0f)
         }
 
         // ── Eyeshadow ─────────────────────────────────────────────────────────
@@ -454,24 +558,92 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             val rightLinerW = MakeupGeometry.eyeHeight(lm, RIGHT_UPPER_LID_ARC, LandmarkIndex.RIGHT_EYE_LOWER, mirror, aspectScale) * 0.10f
 
             // Pass 1: soft shadow base
-            setMkColor(style.linerColor, style.linerAlpha * 0.22f)
-            drawGeometry(MakeupGeometry.buildStrokeMesh(lm, LEFT_LINER,  leftLinerW  * 2.2f, mirror, aspectScale))
-            drawGeometry(MakeupGeometry.buildStrokeMesh(lm, RIGHT_LINER, rightLinerW * 2.2f, mirror, aspectScale))
+            setMkColor(style.linerColor, style.linerAlpha * 0.14f)
+            drawGeometry(MakeupGeometry.buildStrokeMesh(lm, LEFT_LINER,  leftLinerW  * 2.0f, mirror, aspectScale))
+            drawGeometry(MakeupGeometry.buildStrokeMesh(lm, RIGHT_LINER, rightLinerW * 2.0f, mirror, aspectScale))
 
             // Pass 2: mid pigment
-            setMkColor(style.linerColor, style.linerAlpha * 0.45f)
+            setMkColor(style.linerColor, style.linerAlpha * 0.28f)
             drawGeometry(MakeupGeometry.buildStrokeMesh(lm, LEFT_LINER,  leftLinerW  * 1.2f, mirror, aspectScale))
             drawGeometry(MakeupGeometry.buildStrokeMesh(lm, RIGHT_LINER, rightLinerW * 1.2f, mirror, aspectScale))
 
             // Pass 3: defined sharp line
-            setMkColor(style.linerColor, style.linerAlpha * 0.40f)
+            setMkColor(style.linerColor, style.linerAlpha * 0.30f)
             drawGeometry(MakeupGeometry.buildStrokeMesh(lm, LEFT_LINER,  leftLinerW  * 0.65f, mirror, aspectScale))
             drawGeometry(MakeupGeometry.buildStrokeMesh(lm, RIGHT_LINER, rightLinerW * 0.65f, mirror, aspectScale))
 
             // Upper lash liner
-            setMkColor(style.linerColor, style.linerAlpha * 0.35f)
+            setMkColor(style.linerColor, style.linerAlpha * 0.24f)
             drawGeometry(MakeupGeometry.buildStrokeMesh(lm, LEFT_UPPER_LINER,  leftLinerW  * 0.5f, mirror, aspectScale))
             drawGeometry(MakeupGeometry.buildStrokeMesh(lm, RIGHT_UPPER_LINER, rightLinerW * 0.5f, mirror, aspectScale))
+
+            // Micro-wing: extend slightly past the outer corner tangent.
+            fun drawWing(outerIdx: Int, nextIdx: Int, wingLen: Float, wingW: Float) {
+                val ox = MakeupGeometry.lmX(lm, outerIdx, mirror, aspectScale)
+                val oy = MakeupGeometry.lmY(lm, outerIdx)
+                val nx = MakeupGeometry.lmX(lm, nextIdx, mirror, aspectScale)
+                val ny = MakeupGeometry.lmY(lm, nextIdx)
+
+                var dx = ox - nx
+                var dy = oy - ny
+                val d = Math.sqrt((dx * dx + dy * dy).toDouble()).toFloat().coerceAtLeast(1e-6f)
+                dx /= d; dy /= d
+
+                val wx = ox + dx * wingLen
+                val wy = oy + dy * wingLen
+
+                val seg = floatArrayOf(ox, oy, wx, wy)
+                drawGeometry(MakeupGeometry.buildStrokeMesh2D(seg, wingW))
+            }
+
+            val wingLenL = (leftLinerW * 2.3f).coerceIn(0.008f, 0.045f)
+            val wingLenR = (rightLinerW * 2.3f).coerceIn(0.008f, 0.045f)
+            val wingWl = (leftLinerW * 0.42f).coerceIn(0.0025f, 0.012f)
+            val wingWr = (rightLinerW * 0.42f).coerceIn(0.0025f, 0.012f)
+
+            setMkColor(style.linerColor, style.linerAlpha * 0.26f)
+            // Upper liner arrays start at the outer corner on both eyes.
+            drawWing(LEFT_UPPER_LINER[0], LEFT_UPPER_LINER[1], wingLenL, wingWl)
+            drawWing(RIGHT_UPPER_LINER[0], RIGHT_UPPER_LINER[1], wingLenR, wingWr)
+        }
+
+        // ── Lashes (natural mascara) ─────────────────────────────────────────
+        if (style.lashAlpha > 0.01f) {
+            GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+            GLES20.glUniform1f(mkUBlendMode, 1f)  // multiply-like
+            GLES20.glUniform1f(mkUGradientDir, 0f)
+
+            val leftEyeH  = MakeupGeometry.eyeHeight(lm, LEFT_UPPER_LID_ARC,  LandmarkIndex.LEFT_EYE_LOWER,  mirror, aspectScale)
+            val rightEyeH = MakeupGeometry.eyeHeight(lm, RIGHT_UPPER_LID_ARC, LandmarkIndex.RIGHT_EYE_LOWER, mirror, aspectScale)
+
+            val leftLen  = (leftEyeH * 0.55f).coerceIn(0.006f, 0.050f)
+            val rightLen = (rightEyeH * 0.55f).coerceIn(0.006f, 0.050f)
+            val leftTh   = (leftEyeH * 0.055f).coerceIn(0.0012f, 0.010f)
+            val rightTh  = (rightEyeH * 0.055f).coerceIn(0.0012f, 0.010f)
+
+            setMkColor(style.lashColor, style.lashAlpha)
+            drawGeometry(
+                MakeupGeometry.buildUpperLashesMesh(
+                    lm = lm,
+                    upperLinerIndices = LEFT_UPPER_LINER,
+                    isMirrored = mirror,
+                    lengthNdc = leftLen,
+                    thicknessNdc = leftTh,
+                    aspectScale = aspectScale,
+                    subdivisionsPerSegment = 4,
+                )
+            )
+            drawGeometry(
+                MakeupGeometry.buildUpperLashesMesh(
+                    lm = lm,
+                    upperLinerIndices = RIGHT_UPPER_LINER,
+                    isMirrored = mirror,
+                    lengthNdc = rightLen,
+                    thicknessNdc = rightTh,
+                    aspectScale = aspectScale,
+                    subdivisionsPerSegment = 4,
+                )
+            )
         }
 
         // ── Lips ──────────────────────────────────────────────────────────────
@@ -597,6 +769,87 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             (c.blue + (1f - c.blue) * factor).coerceIn(0f, 1f),
             c.alpha,
         )
+
+    private fun createNoiseTexture(size: Int, seed: Int): Int {
+        val texIds = IntArray(1)
+        GLES20.glGenTextures(1, texIds, 0)
+        val id = texIds[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, id)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_REPEAT)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_REPEAT)
+
+        // Small grayscale noise with both coarse blotches and fine grain.
+        val coarseSize = 8
+        val coarse = FloatArray(coarseSize * coarseSize)
+        var s = seed
+        fun nextFloat(): Float {
+            s = (1664525 * s + 1013904223)
+            val v = (s ushr 8) and 0x00FFFFFF
+            return v.toFloat() / 16777215f
+        }
+        for (i in coarse.indices) coarse[i] = nextFloat()
+
+        fun lerp(a: Float, b: Float, t: Float) = a + (b - a) * t
+        fun smooth(t: Float) = t * t * (3f - 2f * t)
+        fun sampleCoarse(u: Float, v: Float): Float {
+            val x = u * coarseSize
+            val y = v * coarseSize
+            val x0 = floor(x).toInt().coerceIn(0, coarseSize - 1)
+            val y0 = floor(y).toInt().coerceIn(0, coarseSize - 1)
+            val x1 = (x0 + 1).coerceIn(0, coarseSize - 1)
+            val y1 = (y0 + 1).coerceIn(0, coarseSize - 1)
+            val tx = smooth((x - x0.toFloat()).coerceIn(0f, 1f))
+            val ty = smooth((y - y0.toFloat()).coerceIn(0f, 1f))
+            val a = coarse[y0 * coarseSize + x0]
+            val b = coarse[y0 * coarseSize + x1]
+            val c = coarse[y1 * coarseSize + x0]
+            val d = coarse[y1 * coarseSize + x1]
+            return lerp(lerp(a, b, tx), lerp(c, d, tx), ty)
+        }
+
+        val gray = ByteArray(size * size)
+        for (y in 0 until size) {
+            for (x in 0 until size) {
+                val u = x.toFloat() / size.toFloat()
+                val v = y.toFloat() / size.toFloat()
+                val low = sampleCoarse(u, v)
+                val high = nextFloat()
+                val n = (0.5f + (low - 0.5f) * 0.65f + (high - 0.5f) * 0.20f).coerceIn(0f, 1f)
+                gray[y * size + x] = (n * 255f).toInt().coerceIn(0, 255).toByte()
+            }
+        }
+
+        // Make the tile seamless under GL_REPEAT + GL_LINEAR by matching wrap edges.
+        for (x in 0 until size) {
+            gray[(size - 1) * size + x] = gray[0 * size + x]
+        }
+        for (y in 0 until size) {
+            gray[y * size + (size - 1)] = gray[y * size + 0]
+        }
+        gray[(size - 1) * size + (size - 1)] = gray[0]
+
+        val buf = ByteBuffer.allocateDirect(size * size * 4).order(ByteOrder.nativeOrder())
+        for (i in 0 until size * size) {
+            val g = gray[i]
+            buf.put(g); buf.put(g); buf.put(g); buf.put(0xFF.toByte())
+        }
+        buf.position(0)
+
+        GLES20.glTexImage2D(
+            GLES20.GL_TEXTURE_2D,
+            0,
+            GLES20.GL_RGBA,
+            size,
+            size,
+            0,
+            GLES20.GL_RGBA,
+            GLES20.GL_UNSIGNED_BYTE,
+            buf,
+        )
+        return id
+    }
 
 
 

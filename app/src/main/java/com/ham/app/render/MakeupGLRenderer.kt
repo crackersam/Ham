@@ -64,7 +64,11 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var foundUSmooth = 0
     private var foundUTone = 0
     private var foundUFoundAlpha = 0
+    private var foundUFoundTint = -1
+    private var foundUFoundCoverage = -1
     private var foundUMirror = 0
+    private var foundUDebugFoundation = -1
+    private var foundUDebugColor = -1
 
     // ── Makeup shader ─────────────────────────────────────────────────────────
     private var mkProg = 0
@@ -102,6 +106,12 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
     /** Whether we're currently mirroring (true for live preview). */
     var isMirrored = true
+
+    /**
+     * Debug foundation modes:
+     * 0 = off, 1 = mask overlay, 2 = delta view (amplified |foundation - camera|).
+     */
+    @Volatile var debugFoundationMode: Int = 0
 
     /**
      * Dimensions of the most-recent analysis bitmap passed to MediaPipe
@@ -209,7 +219,11 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         foundUSmooth      = GLES20.glGetUniformLocation(foundProg,  "uSmooth")
         foundUTone        = GLES20.glGetUniformLocation(foundProg,  "uTone")
         foundUFoundAlpha  = GLES20.glGetUniformLocation(foundProg,  "uFoundAlpha")
+        foundUFoundTint   = GLES20.glGetUniformLocation(foundProg,  "uFoundTint")
+        foundUFoundCoverage = GLES20.glGetUniformLocation(foundProg, "uFoundCoverage")
         foundUMirror      = GLES20.glGetUniformLocation(foundProg,  "uMirror")
+        foundUDebugFoundation = GLES20.glGetUniformLocation(foundProg, "uDebugFoundation")
+        foundUDebugColor = GLES20.glGetUniformLocation(foundProg, "uDebugColor")
 
         val mkVert = loadRawString(context, R.raw.makeup_vertex)
         val mkFrag = loadRawString(context, R.raw.makeup_fragment)
@@ -381,7 +395,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         // Drawn first so all subsequent makeup layers composite on top.
         // Samples the camera texture within the face-oval mesh boundary,
         // applying skin-smoothing and warmth correction only where the face is.
-        if (style.foundationAlpha > 0.01f) {
+        if (style.foundationAlpha > 0.01f || debugFoundationMode != 0) {
             GLES20.glUseProgram(foundProg)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, camTextureId)
@@ -393,8 +407,23 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             GLES20.glUniform2f(foundUTexelSize, 1f / texW.toFloat(), 1f / texH.toFloat())
             GLES20.glUniform1f(foundUSmooth, smoothIntensity)
             GLES20.glUniform1f(foundUTone, toneIntensity)
-            GLES20.glUniform1f(foundUFoundAlpha, style.foundationAlpha)
+            val alpha = if (debugFoundationMode != 0) maxOf(style.foundationAlpha, 0.65f) else style.foundationAlpha
+            GLES20.glUniform1f(foundUFoundAlpha, alpha)
             GLES20.glUniform1f(foundUMirror, if (mirror) 1f else 0f)
+
+            if (foundUFoundTint >= 0) {
+                GLES20.glUniform3f(foundUFoundTint, style.foundationTint.red, style.foundationTint.green, style.foundationTint.blue)
+            }
+            if (foundUFoundCoverage >= 0) {
+                GLES20.glUniform1f(foundUFoundCoverage, style.foundationCoverage.coerceIn(0f, 1f))
+            }
+
+            if (foundUDebugFoundation >= 0) {
+                GLES20.glUniform1f(foundUDebugFoundation, debugFoundationMode.toFloat())
+            }
+            if (foundUDebugColor >= 0) {
+                GLES20.glUniform3f(foundUDebugColor, 0.15f, 1.0f, 0.25f)
+            }
 
             drawFoundation(MakeupGeometry.buildFanMesh(lm, FACE_OVAL, mirror, aspectScale))
         }

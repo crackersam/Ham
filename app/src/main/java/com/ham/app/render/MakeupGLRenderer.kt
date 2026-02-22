@@ -32,6 +32,20 @@ private const val STRIDE = 5 * FLOAT_SIZE   // position(2) + edgeFactor(1) + reg
  */
 class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
+    enum class PreviewScaleMode {
+        /**
+         * Preserve aspect ratio and show the entire camera frame.
+         * May show letterbox/pillarbox bars when the view aspect differs.
+         */
+        FIT_CENTER,
+
+        /**
+         * Preserve aspect ratio and fill the entire view.
+         * Crops only when the view and camera aspect ratios differ.
+         */
+        FILL_CENTER,
+    }
+
     private data class FramePacket(
         val rgba: ByteBuffer,
         val width: Int,
@@ -51,6 +65,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var camUMirror = 0
     private var camUTone = 0
     private var camUTexture = 0
+    private var camUCropScale = 0
 
     // ── Foundation shader ─────────────────────────────────────────────────────
     // Draws the face-oval mesh sampling the OES camera texture so smoothing
@@ -67,6 +82,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var foundUFoundTint = -1
     private var foundUFoundCoverage = -1
     private var foundUMirror = 0
+    private var foundUCropScale = 0
     private var foundUDebugFoundation = -1
     private var foundUDebugColor = -1
 
@@ -83,6 +99,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var mkUNoiseTex = 0
     private var mkUNoiseScale = 0
     private var mkUNoiseAmount = 0
+    private var mkUCropScale = 0
 
     private var noiseTextureId = 0
 
@@ -106,6 +123,14 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
     /** Whether we're currently mirroring (true for live preview). */
     var isMirrored = true
+
+    /**
+     * How the camera background should be scaled into the view.
+     *
+     * Default is [FIT_CENTER] so the entire camera frame is always visible.
+     * This preserves aspect ratio and adds letterbox/pillarbox bars when needed.
+     */
+    @Volatile var previewScaleMode: PreviewScaleMode = PreviewScaleMode.FIT_CENTER
 
     /**
      * Debug foundation modes:
@@ -207,6 +232,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         camUMirror       = GLES20.glGetUniformLocation(camProg, "uMirror")
         camUTone         = GLES20.glGetUniformLocation(camProg, "uTone")
         camUTexture      = GLES20.glGetUniformLocation(camProg, "uTexture")
+        camUCropScale    = GLES20.glGetUniformLocation(camProg, "uCropScale")
 
         val foundVert = loadRawString(context, R.raw.foundation_vertex)
         val foundFrag = loadRawString(context, R.raw.foundation_fragment)
@@ -222,6 +248,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         foundUFoundTint   = GLES20.glGetUniformLocation(foundProg,  "uFoundTint")
         foundUFoundCoverage = GLES20.glGetUniformLocation(foundProg, "uFoundCoverage")
         foundUMirror      = GLES20.glGetUniformLocation(foundProg,  "uMirror")
+        foundUCropScale   = GLES20.glGetUniformLocation(foundProg,  "uCropScale")
         foundUDebugFoundation = GLES20.glGetUniformLocation(foundProg, "uDebugFoundation")
         foundUDebugColor = GLES20.glGetUniformLocation(foundProg, "uDebugColor")
 
@@ -239,6 +266,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         mkUNoiseTex = GLES20.glGetUniformLocation(mkProg, "uNoiseTex")
         mkUNoiseScale = GLES20.glGetUniformLocation(mkProg, "uNoiseScale")
         mkUNoiseAmount = GLES20.glGetUniformLocation(mkProg, "uNoiseAmount")
+        mkUCropScale = GLES20.glGetUniformLocation(mkProg, "uCropScale")
 
         // Full-screen quad: position(xy) + texCoord(uv).
         //
@@ -293,6 +321,8 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
+        val (scaleX, scaleY) = computePreviewScale()
+
         // ── Pass 1: Camera ────────────────────────────────────────────────────
         if (camTexWidth > 0 && camTexHeight > 0) {
             GLES20.glUseProgram(camProg)
@@ -302,6 +332,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             GLES20.glUniform1i(camUTexture, 0)
             GLES20.glUniform1f(camUMirror, if (isMirrored) 1f else 0f)
             GLES20.glUniform1f(camUTone, toneIntensity)
+            GLES20.glUniform2f(camUCropScale, scaleX, scaleY)
 
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, quadVbo)
             val stride4 = 4 * FLOAT_SIZE
@@ -327,7 +358,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 style.browFillAlpha > 0.01f ||
                 style.lashAlpha > 0.01f
         if (lm != null && hasAnyLayer) {
-            drawMakeup(lm, style)
+            drawMakeup(lm, style, scaleX, scaleY)
         }
 
         // ── Photo capture ─────────────────────────────────────────────────────
@@ -374,11 +405,52 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         )
     }
 
+    /**
+     * Compute clip-space scale (sx, sy) that preserves camera aspect ratio while
+     * mapping into the current view according to [previewScaleMode].
+     *
+     * Implementation detail:
+     * - Scaling < 1.0 on one axis produces letterbox/pillarbox (FIT_CENTER)
+     * - Scaling > 1.0 on one axis produces center-crop (FILL_CENTER)
+     */
+    private fun computePreviewScale(): Pair<Float, Float> {
+        val vw = viewWidth
+        val vh = viewHeight
+        val tw = camTexWidth
+        val th = camTexHeight
+        if (vw <= 0 || vh <= 0 || tw <= 0 || th <= 0) return Pair(1f, 1f)
+
+        val viewAspect = vw.toFloat() / vh.toFloat()
+        val texAspect = tw.toFloat() / th.toFloat()
+        if (viewAspect <= 0f || texAspect <= 0f) return Pair(1f, 1f)
+
+        return when (previewScaleMode) {
+            PreviewScaleMode.FIT_CENTER -> {
+                if (texAspect > viewAspect) {
+                    // Texture wider than view: fit height, shrink Y (bars top/bottom).
+                    Pair(1f, viewAspect / texAspect)
+                } else {
+                    // Texture taller than view: fit width, shrink X (bars left/right).
+                    Pair(texAspect / viewAspect, 1f)
+                }
+            }
+            PreviewScaleMode.FILL_CENTER -> {
+                if (texAspect > viewAspect) {
+                    // Texture wider than view: fill height, expand X (crop left/right).
+                    Pair(texAspect / viewAspect, 1f)
+                } else {
+                    // Texture taller than view: fill width, expand Y (crop top/bottom).
+                    Pair(1f, viewAspect / texAspect)
+                }
+            }
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Makeup drawing
     // ─────────────────────────────────────────────────────────────────────────
 
-    private fun drawMakeup(lm: FloatArray, style: MakeupStyle) {
+    private fun drawMakeup(lm: FloatArray, style: MakeupStyle, cropScaleX: Float, cropScaleY: Float) {
         GLES20.glEnable(GLES20.GL_BLEND)
 
         val mirror = isMirrored
@@ -410,6 +482,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             val alpha = if (debugFoundationMode != 0) maxOf(style.foundationAlpha, 0.65f) else style.foundationAlpha
             GLES20.glUniform1f(foundUFoundAlpha, alpha)
             GLES20.glUniform1f(foundUMirror, if (mirror) 1f else 0f)
+            GLES20.glUniform2f(foundUCropScale, cropScaleX, cropScaleY)
 
             if (foundUFoundTint >= 0) {
                 GLES20.glUniform3f(foundUFoundTint, style.foundationTint.red, style.foundationTint.green, style.foundationTint.blue)
@@ -429,6 +502,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         }
 
         GLES20.glUseProgram(mkProg)
+        GLES20.glUniform2f(mkUCropScale, cropScaleX, cropScaleY)
 
         // Bind grain noise texture (used only for blush; uniforms default to disabled).
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1)

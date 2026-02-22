@@ -10,8 +10,10 @@ attribute vec2 aRegionUV;
 varying float vEdgeFactor;
 varying vec2  vRegionUV;
 
+uniform vec2 uCropScale;
+
 void main() {
     vEdgeFactor = aEdgeFactor;
     vRegionUV   = aRegionUV;
-    gl_Position = vec4(aPosition, 0.0, 1.0);
+    gl_Position = vec4(aPosition * uCropScale, 0.0, 1.0);
 }

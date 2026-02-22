@@ -19,6 +19,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -37,6 +38,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import com.ham.app.camera.CameraManager
 import com.ham.app.data.MAKEUP_STYLES
 import com.ham.app.face.FaceLandmarkerHelper
+import com.ham.app.render.MakeupGLRenderer
 import com.ham.app.render.MakeupGLSurfaceView
 import com.ham.app.render.VideoRecorder
 import kotlinx.coroutines.delay
@@ -51,6 +53,7 @@ fun CameraScreen(modelReady: Boolean) {
     val scope = rememberCoroutineScope()
 
     var selectedStyleIndex by remember { mutableIntStateOf(1) }
+    var filtersVisible by remember { mutableStateOf(false) }
     var isRecording by remember { mutableStateOf(false) }
     var flashVisible by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf<String?>(null) }
@@ -128,29 +131,142 @@ fun CameraScreen(modelReady: Boolean) {
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            // ── GL Surface View (never overlaps the bottom bar) ─────────────────
+            BoxWithConstraints(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+            ) {
+                val targetAspect = 9f / 16f
+                val screenAspect = (maxWidth / maxHeight)
+                val windowModifier =
+                    if (screenAspect > targetAspect) {
+                        // Screen is relatively wide: fit by height (bars left/right).
+                        Modifier.fillMaxHeight().aspectRatio(targetAspect)
+                    } else {
+                        // Screen is relatively tall/narrow: fit by width (bars top/bottom).
+                        Modifier.fillMaxWidth().aspectRatio(targetAspect)
+                    }
 
-        // ── GL Surface View ───────────────────────────────────────────────────
-        AndroidView(
-            factory = { ctx ->
-                MakeupGLSurfaceView(ctx).also { sv ->
-                    sv.layoutParams = ViewGroup.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT,
+                Box(
+                    modifier = windowModifier
+                        .align(Alignment.TopCenter)
+                        .clip(RoundedCornerShape(26.dp))
+                        .background(Color.Black),
+                ) {
+                    AndroidView(
+                        factory = { ctx ->
+                            MakeupGLSurfaceView(ctx).also { sv ->
+                                sv.layoutParams = ViewGroup.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                )
+                                glSurfaceViewRef.value = sv
+
+                                // Always show the full camera frame in the preview window (no crop/distort).
+                                sv.renderer.previewScaleMode = MakeupGLRenderer.PreviewScaleMode.FIT_CENTER
+
+                                // Set initial style
+                                sv.renderer.currentStyle = MAKEUP_STYLES[selectedStyleIndex]
+
+                                // CameraX binding must happen on the main thread.
+                                Handler(Looper.getMainLooper()).post {
+                                    if (modelReady) landmarkerHelper.setup()
+                                    cameraManager.bind(lifecycleOwner, sv, landmarkerHelper)
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize(),
                     )
-                    glSurfaceViewRef.value = sv
+                }
+            }
 
-                    // Set initial style
-                    sv.renderer.currentStyle = MAKEUP_STYLES[selectedStyleIndex]
+            // ── Bottom controls (separate from preview) ─────────────────────────
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(bottom = 8.dp),
+            ) {
 
-                    // CameraX binding must happen on the main thread.
-                    Handler(Looper.getMainLooper()).post {
-                        if (modelReady) landmarkerHelper.setup()
-                        cameraManager.bind(lifecycleOwner, sv, landmarkerHelper)
+                // Filter selector
+                AnimatedVisibility(
+                    visible = filtersVisible,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                ) {
+                    FilterSelectorBar(
+                        selectedIndex = selectedStyleIndex,
+                        onStyleSelected = { idx ->
+                            selectedStyleIndex = idx
+                            glSurfaceViewRef.value?.renderer?.currentStyle = MAKEUP_STYLES[idx]
+                        },
+                    )
+                }
+
+                // Capture / Record row
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xCC000000))
+                        .padding(vertical = 20.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 32.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        // Photo shutter
+                        ShutterButton(
+                            label = "Photo",
+                            isDestructive = false,
+                            onClick = {
+                                val sv = glSurfaceViewRef.value ?: return@ShutterButton
+                                flashVisible = true
+                                scope.launch { delay(80); flashVisible = false }
+                                sv.renderer.onPixelsReady = { bytes, w, h ->
+                                    savePhoto(context, bytes, w, h) { msg ->
+                                        scope.launch { statusText = msg }
+                                    }
+                                    sv.renderer.onPixelsReady = null
+                                }
+                                sv.queueEvent { sv.renderer.requestCapture() }
+                            },
+                        )
+
+                        // Record button
+                        ShutterButton(
+                            label = if (isRecording) "Stop" else "Video",
+                            isDestructive = isRecording,
+                            onClick = {
+                                val sv = glSurfaceViewRef.value ?: return@ShutterButton
+                                if (!isRecording) {
+                                    isRecording = true
+                                    videoRecorder.onRecordingFinished = { _ ->
+                                        scope.launch { statusText = "Video saved!" }
+                                    }
+                                    videoRecorder.start(sv, sv.width, sv.height)
+                                } else {
+                                    isRecording = false
+                                    videoRecorder.stop()
+                                }
+                            },
+                        )
+
+                        // Makeup styles toggle (shows/hides the selector bar)
+                        ShutterButton(
+                            label = "Makeup",
+                            isDestructive = false,
+                            onClick = { filtersVisible = !filtersVisible },
+                        )
                     }
                 }
-            },
-            modifier = Modifier.fillMaxSize(),
-        )
+            }
+        }
 
         // ── Loading overlay (while model is downloading) ──────────────────────
         AnimatedVisibility(
@@ -165,8 +281,11 @@ fun CameraScreen(modelReady: Boolean) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     CircularProgressIndicator(color = Color.White)
                     Spacer(Modifier.height(16.dp))
-                    Text("Preparing Ham filters…",
-                        color = Color.White, fontSize = 16.sp)
+                    Text(
+                        "Preparing Ham filters…",
+                        color = Color.White,
+                        fontSize = 16.sp,
+                    )
                 }
             }
         }
@@ -212,72 +331,6 @@ fun CameraScreen(modelReady: Boolean) {
             }
         }
 
-        // ── Bottom controls ───────────────────────────────────────────────────
-        Column(
-            modifier = Modifier.align(Alignment.BottomCenter),
-        ) {
-
-            // Filter selector
-            FilterSelectorBar(
-                selectedIndex = selectedStyleIndex,
-                onStyleSelected = { idx ->
-                    selectedStyleIndex = idx
-                    glSurfaceViewRef.value?.renderer?.currentStyle = MAKEUP_STYLES[idx]
-                },
-            )
-
-            // Capture / Record row
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xCC000000))
-                    .padding(vertical = 20.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(48.dp),
-                ) {
-                    // Photo shutter
-                    ShutterButton(
-                        label = "Photo",
-                        isDestructive = false,
-                        onClick = {
-                            val sv = glSurfaceViewRef.value ?: return@ShutterButton
-                            flashVisible = true
-                            scope.launch { delay(80); flashVisible = false }
-                            sv.renderer.onPixelsReady = { bytes, w, h ->
-                                savePhoto(context, bytes, w, h) { msg ->
-                                    scope.launch { statusText = msg }
-                                }
-                                sv.renderer.onPixelsReady = null
-                            }
-                            sv.queueEvent { sv.renderer.requestCapture() }
-                        },
-                    )
-
-                    // Record button
-                    ShutterButton(
-                        label = if (isRecording) "Stop" else "Video",
-                        isDestructive = isRecording,
-                        onClick = {
-                            val sv = glSurfaceViewRef.value ?: return@ShutterButton
-                            if (!isRecording) {
-                                isRecording = true
-                                videoRecorder.onRecordingFinished = { _ ->
-                                    scope.launch { statusText = "Video saved!" }
-                                }
-                                videoRecorder.start(sv, sv.width, sv.height)
-                            } else {
-                                isRecording = false
-                                videoRecorder.stop()
-                            }
-                        },
-                    )
-                }
-            }
-        }
-
         // ── Flash overlay ─────────────────────────────────────────────────────
         AnimatedVisibility(
             visible = flashVisible,
@@ -306,6 +359,13 @@ private fun ShutterButton(
     )
 
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            label,
+            color = Color.White,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+        )
+        Spacer(Modifier.height(6.dp))
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
@@ -333,9 +393,6 @@ private fun ShutterButton(
                 )
             }
         }
-        Spacer(Modifier.height(6.dp))
-        Text(label, color = Color.White, fontSize = 12.sp,
-            fontWeight = FontWeight.Medium)
     }
 }
 

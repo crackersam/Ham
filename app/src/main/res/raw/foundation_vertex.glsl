@@ -8,6 +8,7 @@ attribute float aEdgeFactor;
 attribute vec2  aRegionUV;
 
 uniform float uMirror;
+uniform vec2 uCropScale;
 
 varying float vEdgeFactor;
 varying vec2  vCamUV;
@@ -15,11 +16,18 @@ varying vec2  vCamUV;
 void main() {
     vEdgeFactor = aEdgeFactor;
 
+    vec2 ndcPos = aPosition * uCropScale;
+
     // Convert NDC position → screen UV [0,1] matching the camera convention:
     //   camera UV Y=0 is at the TOP of the image (Android buffer origin),
     //   NDC Y=+1 is the TOP of the screen, so:
     //       screen_u = (ndcX + 1) / 2
     //       screen_v = (1 - ndcY) / 2
+    //
+    // IMPORTANT: vCamUV must be derived from the *unscaled* geometry coordinate so
+    // the foundation samples the same camera pixels as the background quad. If we
+    // derive UVs from the scaled (letterboxed) clip-space position, the camera
+    // image appears warped only inside the face mesh.
     vec2 screenUV = vec2((aPosition.x + 1.0) * 0.5,
                          (1.0 - aPosition.y) * 0.5);
 
@@ -27,5 +35,5 @@ void main() {
     if (uMirror > 0.5) screenUV.x = 1.0 - screenUV.x;
     vCamUV = screenUV;
 
-    gl_Position = vec4(aPosition, 0.0, 1.0);
+    gl_Position = vec4(ndcPos, 0.0, 1.0);
 }

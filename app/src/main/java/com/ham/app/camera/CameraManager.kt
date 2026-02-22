@@ -4,9 +4,11 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.util.Log
-import android.util.Size
+import android.view.Surface
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.ham.app.face.FaceLandmarkerHelper
@@ -46,21 +48,23 @@ class CameraManager(private val context: Context) {
             val provider = providerFuture.get()
             cameraProvider = provider
 
+            val targetRotation = context.display?.rotation ?: Surface.ROTATION_0
+            val resolutionSelector = ResolutionSelector.Builder()
+                // Prefer 16:9 so portrait rotation produces a 9:16 stream,
+                // which fits the UI's 9:16 preview window without looking squarish.
+                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+                .build()
+
             val capture = ImageCapture.Builder()
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                .setTargetResolution(Size(1280, 720))
+                .setTargetRotation(targetRotation)
+                .setResolutionSelector(resolutionSelector)
                 .build()
             imageCapture = capture
 
             val analysis = ImageAnalysis.Builder()
-                // 640×360 (16:9) matches the preview aspect ratio so both
-                // use cases receive the same sensor crop from the camera HAL.
-                // A 4:3 target (e.g. 320×240) would give a different field of
-                // view than the 16:9 preview, making landmark y-positions
-                // systematically wrong relative to what appears on screen.
-                // MediaPipe internally resizes to 192×192, so 640×360 is
-                // still far smaller than the original 1280×720 analysis feed.
-                .setTargetResolution(Size(640, 360))
+                .setTargetRotation(targetRotation)
+                .setResolutionSelector(resolutionSelector)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()

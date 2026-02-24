@@ -453,6 +453,194 @@ object MakeupGeometry {
         return verts
     }
 
+    /**
+     * Like [buildBlushMesh] but rotates the ellipse using an explicit orthonormal basis.
+     *
+     * - [axisX] defines the local +X direction of the ellipse in NDC space.
+     * - [axisY] defines the local +Y direction of the ellipse in NDC space.
+     *
+     * The emitted [regionUV] stays in ellipse-local space (unit circle around 0.5,0.5),
+     * so shaders can apply directional contour falloff consistently regardless of rotation.
+     */
+    fun buildRotatedEllipseMesh(
+        centerX: Float,
+        centerY: Float,
+        radiusX: Float,
+        radiusY: Float,
+        axisXx: Float,
+        axisXy: Float,
+        axisYx: Float,
+        axisYy: Float,
+        segments: Int = 32,
+        centerEdgeFactor: Float = 1f,
+        rimEdgeFactor: Float = 0f,
+    ): FloatArray {
+        val verts = FloatArray(segments * 3 * STRIDE)
+        var vi = 0
+        val step = (2.0 * Math.PI / segments).toFloat()
+        for (i in 0 until segments) {
+            val a0 = step * i
+            val a1 = step * (i + 1)
+
+            // Center
+            verts[vi++] = centerX; verts[vi++] = centerY
+            verts[vi++] = centerEdgeFactor; verts[vi++] = 0.5f; verts[vi++] = 0.5f
+
+            fun emitRim(angle: Float) {
+                val c = Math.cos(angle.toDouble()).toFloat()
+                val s = Math.sin(angle.toDouble()).toFloat()
+                val lx = c * radiusX
+                val ly = s * radiusY
+                val px = centerX + lx * axisXx + ly * axisYx
+                val py = centerY + lx * axisXy + ly * axisYy
+                verts[vi++] = px
+                verts[vi++] = py
+                verts[vi++] = rimEdgeFactor
+                verts[vi++] = 0.5f + 0.5f * c
+                verts[vi++] = 0.5f + 0.5f * s
+            }
+
+            // Edge vertex i
+            emitRim(a0)
+            // Edge vertex i+1
+            emitRim(a1)
+        }
+        return verts
+    }
+
+    /**
+     * Builds a soft under-eye concealer mesh (single rotated ellipse) positioned
+     * just below the lower lid and aligned to the eye's inner→outer axis.
+     *
+     * The returned mesh is suitable for the foundation shader, which samples
+     * the camera texture and applies lift/neutralization (concealer).
+     */
+    fun buildUnderEyeConcealerMesh(
+        lm: FloatArray,
+        innerCornerIdx: Int,
+        outerCornerIdx: Int,
+        lowerLidIdx: Int,
+        isMirrored: Boolean = true,
+        aspectScale: Float = 1f,
+        noseIdx: Int = LandmarkIndex.NOSE_TIP,
+        segments: Int = 46,
+    ): FloatArray {
+        val ix = lmX(lm, innerCornerIdx, isMirrored, aspectScale)
+        val iy = lmY(lm, innerCornerIdx)
+        val ox = lmX(lm, outerCornerIdx, isMirrored, aspectScale)
+        val oy = lmY(lm, outerCornerIdx)
+        val lx = lmX(lm, lowerLidIdx, isMirrored, aspectScale)
+        val ly = lmY(lm, lowerLidIdx)
+
+        val midX = (ix + ox) * 0.5f
+        val midY = (iy + oy) * 0.5f
+
+        var ax = ox - ix
+        var ay = oy - iy
+        var aLen = Math.sqrt((ax * ax + ay * ay).toDouble()).toFloat().coerceAtLeast(1e-6f)
+        ax /= aLen; ay /= aLen
+
+        // Perpendicular "up" in NDC (positive y).
+        var upX = -ay
+        var upY = ax
+        if (upY < 0f) { upX = -upX; upY = -upY }
+        val downX = -upX
+        val downY = -upY
+
+        // Eye height proxy: distance from corner-midline down to the lower lid.
+        val eyeH = (midY - ly).coerceAtLeast(0.001f)
+
+        // Direction toward nose (pulls the ellipse slightly inward so it stays on skin).
+        val nx0 = lmX(lm, noseIdx, isMirrored, aspectScale)
+        val ny0 = lmY(lm, noseIdx)
+        var nx = nx0 - midX
+        var ny = ny0 - midY
+        val nLen = Math.sqrt((nx * nx + ny * ny).toDouble()).toFloat().coerceAtLeast(1e-6f)
+        nx /= nLen; ny /= nLen
+
+        // Placement: slightly below the lower lid, with a tiny inward bias.
+        val centerX = midX + nx * (aLen * 0.04f) + downX * (eyeH * 0.58f)
+        val centerY = midY + ny * (aLen * 0.04f) + downY * (eyeH * 0.58f)
+
+        // Size: elongated along the eye axis, not too tall (avoid cheek).
+        val radiusX = (aLen * 0.34f).coerceIn(0.010f, 0.35f)
+        val radiusY = (eyeH * 0.70f).coerceIn(0.006f, 0.22f)
+
+        return buildRotatedEllipseMesh(
+            centerX = centerX,
+            centerY = centerY,
+            radiusX = radiusX,
+            radiusY = radiusY,
+            axisXx = ax,
+            axisXy = ay,
+            axisYx = upX,
+            axisYy = upY,
+            segments = segments,
+            centerEdgeFactor = 1f,
+            rimEdgeFactor = 0f,
+        )
+    }
+
+    /**
+     * Builds a featherable ribbon mesh between two polylines in NDC space.
+     *
+     * [outerPts] and [innerPts] are explicit NDC polylines: [x0,y0,x1,y1,...] with matching point counts.
+     * The mesh is a triangle strip made of two triangles per segment.
+     *
+     * - [outerEdgeFactor] / [innerEdgeFactor] control feathering across the ribbon thickness.
+     * - [outerV] / [innerV] are written to regionUV.y and can be used by shaders for directional bias.
+     * - regionUV.x encodes progress along the polyline (0..1).
+     */
+    fun buildRibbonMesh2D(
+        outerPts: FloatArray,
+        innerPts: FloatArray,
+        outerEdgeFactor: Float = 1f,
+        innerEdgeFactor: Float = 0f,
+        outerV: Float = 1f,
+        innerV: Float = 0f,
+    ): FloatArray {
+        val nOuter = outerPts.size / 2
+        val nInner = innerPts.size / 2
+        val n = minOf(nOuter, nInner)
+        if (n < 2) return FloatArray(0)
+
+        fun vtx(
+            out: MutableList<Float>,
+            x: Float,
+            y: Float,
+            ef: Float,
+            u: Float,
+            v: Float,
+        ) {
+            out += floatArrayOf(x, y, ef, u, v).toList()
+        }
+
+        val out = mutableListOf<Float>()
+        val denom = (n - 1).toFloat().coerceAtLeast(1f)
+        for (i in 0 until n - 1) {
+            val next = i + 1
+            val u0 = i.toFloat() / denom
+            val u1 = next.toFloat() / denom
+
+            val ox0 = outerPts[i * 2];       val oy0 = outerPts[i * 2 + 1]
+            val ox1 = outerPts[next * 2];    val oy1 = outerPts[next * 2 + 1]
+            val ix0 = innerPts[i * 2];       val iy0 = innerPts[i * 2 + 1]
+            val ix1 = innerPts[next * 2];    val iy1 = innerPts[next * 2 + 1]
+
+            // Tri 1: outer[i], outer[i+1], inner[i]
+            vtx(out, ox0, oy0, outerEdgeFactor, u0, outerV)
+            vtx(out, ox1, oy1, outerEdgeFactor, u1, outerV)
+            vtx(out, ix0, iy0, innerEdgeFactor, u0, innerV)
+
+            // Tri 2: inner[i], outer[i+1], inner[i+1]
+            vtx(out, ix0, iy0, innerEdgeFactor, u0, innerV)
+            vtx(out, ox1, oy1, outerEdgeFactor, u1, outerV)
+            vtx(out, ix1, iy1, innerEdgeFactor, u1, innerV)
+        }
+
+        return out.toFloatArray()
+    }
+
     // ── Lash mesh ────────────────────────────────────────────────────────────
 
     /**
@@ -481,13 +669,18 @@ object MakeupGeometry {
         cx /= n.toFloat(); cy /= n.toFloat()
 
         val segCount = n - 1
-        val subs = subdivisionsPerSegment.coerceIn(1, 6)
+        val subs = subdivisionsPerSegment.coerceIn(1, 8)
 
         val result = mutableListOf<Float>()
 
         fun addV(x: Float, y: Float, ef: Float) {
             // Keep regionUV stable; not used for lashes.
             result += floatArrayOf(x, y, ef, 0.5f, 0.5f).toList()
+        }
+
+        fun smoothstep(e0: Float, e1: Float, x: Float): Float {
+            val t = ((x - e0) / (e1 - e0)).coerceIn(0f, 1f)
+            return t * t * (3f - 2f * t)
         }
 
         for (si in 0 until segCount) {
@@ -504,10 +697,20 @@ object MakeupGeometry {
                 val px = x0 + (x1 - x0) * t
                 val py = y0 + (y1 - y0) * t
 
-                // Normalized position along lid for bell-curve lash length.
+                // Normalized position along lid.
+                // Note: for our upper-liner arrays, u=0 is typically the *outer* corner and u=1 the inner.
                 val u = (si.toFloat() + t) / segCount.toFloat()
-                val bell = Math.sin((u * Math.PI).toDouble()).toFloat().coerceIn(0f, 1f)
-                val lashLen = lengthNdc * (0.35f + 0.65f * bell)
+                val mid = Math.sin((u * Math.PI).toDouble()).toFloat().coerceIn(0f, 1f) // 0→1→0
+                val outer = (1f - u).coerceIn(0f, 1f)
+                val outerBoost = Math.sqrt(outer.toDouble()).toFloat().coerceIn(0f, 1f)
+
+                // Keep corners from clumping while preserving a fuller outer third.
+                val endFade = smoothstep(0.00f, 0.09f, u) * smoothstep(0.00f, 0.11f, 1f - u) // 0 at corners
+                val endTaper = (0.10f + 0.90f * endFade).coerceIn(0f, 1f) // never fully off
+
+                // Professional glam: fuller + slightly longer toward the outer corner.
+                val fullness = (0.20f + 0.50f * mid + 0.42f * outerBoost).coerceIn(0f, 1f)
+                val lashLen = lengthNdc * (0.28f + 0.72f * fullness) * endTaper
 
                 // Point lashes outward from eye center.
                 var dx = px - cx
@@ -515,10 +718,25 @@ object MakeupGeometry {
                 val dLen = Math.sqrt((dx * dx + dy * dy).toDouble()).toFloat().coerceAtLeast(1e-6f)
                 dx /= dLen; dy /= dLen
 
-                val tipX = px + dx * lashLen
-                val tipY = py + dy * lashLen
+                // Slight curl: blend outward direction with lid normal and global up,
+                // stronger toward the outer corner for a more lifted, pro finish.
+                var nx = -ty
+                var ny = tx
+                val ndot = nx * dx + ny * dy
+                if (ndot < 0f) { nx = -nx; ny = -ny } // ensure "outward" relative to eye center
 
-                val baseHalf = thicknessNdc * (0.75f + 0.45f * bell)
+                val curl = ((0.16f + 0.46f * outerBoost) * endTaper).coerceIn(0f, 0.75f)
+                var dirX = dx + nx * (0.28f * curl)
+                var dirY = dy + ny * (0.28f * curl) + (0.48f * curl)
+                val dirLen = Math.sqrt((dirX * dirX + dirY * dirY).toDouble()).toFloat().coerceAtLeast(1e-6f)
+                dirX /= dirLen; dirY /= dirLen
+
+                val tipX = px + dirX * lashLen
+                val tipY = py + dirY * lashLen
+
+                val baseHalfRaw = thicknessNdc * (0.62f + 0.60f * fullness) * endTaper
+                val spacing = (tLen / subs.toFloat()).coerceAtLeast(1e-6f)
+                val baseHalf = kotlin.math.min(baseHalfRaw, spacing * 0.45f)
                 val b0x = px - tx * baseHalf
                 val b0y = py - ty * baseHalf
                 val b1x = px + tx * baseHalf
@@ -645,6 +863,7 @@ object MakeupGeometry {
         outerIndices: IntArray,
         innerIndices: IntArray,
         isMirrored: Boolean = true,
+        innerEdgeFactor: Float = 0.60f,
         aspectScale: Float = 1f,
     ): FloatArray {
         val n = minOf(outerIndices.size, innerIndices.size)
@@ -665,7 +884,7 @@ object MakeupGeometry {
             val ringA  = if (strip == 0) outer else mid
             val ringB  = if (strip == 0) mid   else inner
             val efA    = if (strip == 0) 0f    else 1f   // outer=transparent, mid=opaque
-            val efB    = if (strip == 0) 1f    else 0f   // mid=opaque, inner=transparent
+            val efB    = if (strip == 0) 1f    else innerEdgeFactor.coerceIn(0f, 1f)   // mid=opaque, inner=edge control
 
             for (i in 0 until n) {
                 val next = (i + 1) % n

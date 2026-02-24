@@ -17,6 +17,19 @@ varying float vEdgeFactor;   // 0=edge → 1=center, drives feathering
 varying vec2  vRegionUV;     // [0,1] within region
 varying vec2  vNdcPos;       // clip-space xy after cropScale ([-1,1])
 
+// W3C / Photoshop-like soft-light blend (per-channel).
+vec3 softLight(vec3 base, vec3 blend) {
+    vec3 r1 = base - (1.0 - 2.0 * blend) * base * (1.0 - base);
+
+    // D(base): piecewise function used by soft-light.
+    vec3 d0 = ((16.0 * base - 12.0) * base + 4.0) * base; // base <= 0.25
+    vec3 d1 = sqrt(base);                                  // base  > 0.25
+    vec3 d  = mix(d0, d1, step(vec3(0.25), base));
+
+    vec3 r2 = base + (2.0 * blend - 1.0) * (d - base);
+    return mix(r1, r2, step(vec3(0.5), blend));
+}
+
 void main() {
     // ── Feathered alpha ──────────────────────────────────────────────────────
     // Two-stage smoothstep product: sharper inner ramp (0→0.20) keeps pigment
@@ -60,10 +73,25 @@ void main() {
         float a0 = smoothstep(0.0, 0.14, vEdgeFactor) * smoothstep(0.0, 0.95, vEdgeFactor);
         a0 = pow(a0, 0.85); // slightly longer tail
 
+        // Some highlight meshes are "strokes" (e.g. nose bridge stripe) where regionUV
+        // is not a stable parameter. We flag those by setting uGradientDir >= 2.
+        float isStroke = step(1.5, uGradientDir);
+        if (isStroke > 0.5) {
+            // Reduce the hard-looking ridge right on the centerline and widen the band a touch.
+            a0 = pow(a0, 0.72);
+            float center = smoothstep(0.90, 1.0, vEdgeFactor);
+            a0 *= (1.0 - 0.24 * center);
+        }
+
         // Micro-dither near the rim to break up coherent “edge lines”.
         float rim = 1.0 - smoothstep(0.30, 0.88, vEdgeFactor); // 1 at rim → 0 toward center
         if (uNoiseAmount > 0.001) {
-            vec2 duv = vec2(vRegionUV.x, vEdgeFactor) * uNoiseScale;
+            vec2 duv = vec2(vRegionUV.x, vEdgeFactor);
+            if (isStroke > 0.5) {
+                // Use NDC-derived UV for strokes to avoid seams caused by placeholder regionUVs.
+                duv = vNdcPos * 0.5 + 0.5;
+            }
+            duv *= uNoiseScale;
             float n = texture2D(uNoiseTex, duv).r; // 0..1
             float d = (n - 0.5) * uNoiseAmount;    // small signed
             a0 = clamp(a0 + d * 0.14 * rim, 0.0, 1.0);
@@ -137,7 +165,14 @@ void main() {
         mask *= mix(1.0, 0.45, beard);
 
         // Very subtle grain to avoid banding / sticker-flatness.
-        vec2 nuv = vRegionUV * uNoiseScale;
+        vec2 nuv = vRegionUV;
+        // For contour strokes built via buildStrokeMesh* the regionUV is just a placeholder
+        // (often u≈v), which can create faint seams when used as a noise seed.
+        float strokeUv = 1.0 - step(0.02, abs(vRegionUV.x - vRegionUV.y));
+        if (ribbonShape > 0.5 && strokeUv > 0.5) {
+            nuv = vNdcPos * 0.5 + 0.5;
+        }
+        nuv *= uNoiseScale;
         float n = texture2D(uNoiseTex, nuv).r; // 0..1
         float grain = 1.0 + (n - 0.5) * uNoiseAmount;
         mask *= clamp(grain, 0.88, 1.12);
@@ -162,28 +197,66 @@ void main() {
         edgeAlpha = mask;
     } else if (uEffectKind > 0.5 && uEffectKind < 1.5) {
         // ── Blush realism path ───────────────────────────────────────────────
-        // Uses radial falloff (region UV) + subtle grain modulation so blush
-        // doesn't look like a perfectly-uniform sticker.
-        vec2  p  = vRegionUV - vec2(0.5);
-        float rn = clamp(length(p) * 2.0, 0.0, 1.0); // 0=center .. 1=rim
+        // Make blush read like a pro "melted" application:
+        // - long gaussian tail (no stamp edge)
+        // - gentle lift bias toward the upper/outer cheek
+        // - per-pixel adaptation using the camera tex (avoids beard/cast-shadow artefacts)
+        // - soft-light style shading so skin texture stays visible
 
-        // Gaussian-like pigment distribution with a gentle rim feather.
-        float gaussian = exp(-rn * rn * 4.2);
-        float rimFeather = smoothstep(0.0, 0.28, vEdgeFactor);
-        float blushMask = gaussian * rimFeather;
+        float baseEdge = edgeAlpha; // keep the shared feather curve
 
-        // Mild desaturation reads more like real pigment on skin.
-        float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
-        rgb = mix(vec3(luma), rgb, 0.92);
+        // Ellipse-local coordinate: [-1,1] where (0,0) is the center of the region.
+        vec2 q = (vRegionUV - vec2(0.5)) * 2.0;
+        float r2 = clamp(dot(q, q), 0.0, 1.0);
 
-        // Grain: modulate alpha slightly with repeatable region-anchored noise.
-        // uNoiseAmount is expected to be small (e.g. 0.08–0.16).
-        vec2 nuv = vRegionUV * uNoiseScale;
-        float n = texture2D(uNoiseTex, nuv).r; // 0..1
-        float grain = 1.0 + (n - 0.5) * uNoiseAmount;
-        blushMask *= clamp(grain, 0.75, 1.25);
+        // Core distribution with longer tail (pow < 1 stretches the falloff).
+        float gaussian = exp(-r2 * 4.6);
+        float mask = baseEdge * gaussian;
+        mask = pow(clamp(mask, 0.0, 1.0), 0.85);
 
-        edgeAlpha = blushMask;
+        // Directional bias: "lift" blush upward and slightly toward the cheekbone side.
+        float upT   = smoothstep(-0.10, 0.92, q.y);
+        float outT  = smoothstep(-0.25, 0.95, q.x);
+        float lift  = pow(clamp(upT * outT, 0.0, 1.0), 1.15);
+        mask *= mix(0.82, 1.06, lift);
+
+        // Sample the underlying camera pixel in NDC space (for adaptation).
+        vec2 uv = vec2(vNdcPos.x * 0.5 + 0.5, 0.5 - 0.5 * vNdcPos.y);
+        if (uMirror > 0.5) uv.x = 1.0 - uv.x;
+        vec3 under = texture2D(uCameraTex, uv).rgb;
+        float underLuma = dot(under, vec3(0.2126, 0.7152, 0.0722));
+
+        // Suppress blush a bit on dark, low-sat patches (beard/stubble or deep shadow).
+        float mx = max(under.r, max(under.g, under.b));
+        float mn = min(under.r, min(under.g, under.b));
+        float underSat = mx - mn;
+        float darkDelta = clamp(uSkinLuma - underLuma, 0.0, 0.25);
+        float beard = smoothstep(0.06, 0.16, darkDelta) * (1.0 - smoothstep(0.10, 0.30, underSat));
+        mask *= mix(1.0, 0.78, beard);
+
+        // Micro-dither (not grain): breaks up very faint edge banding.
+        if (uNoiseAmount > 0.001) {
+            vec2 nuv = vRegionUV * uNoiseScale;
+            float n = texture2D(uNoiseTex, nuv).r; // 0..1
+            float rim = 1.0 - smoothstep(0.30, 0.90, vEdgeFactor); // strongest near rim
+            mask = clamp(mask + (n - 0.5) * uNoiseAmount * 0.06 * rim, 0.0, 1.0);
+        }
+
+        // Pigment tone: slight desat reads more like powder on skin.
+        // (Keep saturation a touch higher so the effect doesn't disappear.)
+        float pL = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+        vec3 pigment = mix(vec3(pL), rgb, 0.96);
+
+        // On deeper skin (lower luma), bias the pigment slightly toward the underlying tone
+        // so the blush never reads chalky.
+        float deep = 1.0 - smoothstep(0.34, 0.62, uSkinLuma);
+        pigment = mix(pigment, under, 0.16 * deep);
+
+        // Soft-light style shading preserves skin texture and looks more natural than flat paint.
+        rgb = softLight(under, pigment);
+
+        // Boost compensates for soft-light being more subtle than flat alpha paint.
+        edgeAlpha = clamp(mask * 1.42, 0.0, 1.0);
     } else if (uEffectKind > 1.5) {
         // ── Sparkle / glitter ────────────────────────────────────────────────
         // Build a sparse glitter mask from the noise texture and modulate it

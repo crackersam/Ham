@@ -1216,40 +1216,187 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             val rMx = MakeupGeometry.lmX(lm, LandmarkIndex.LIP_RIGHT, mirror, aspectScale)
             val rMy = MakeupGeometry.lmY(lm, LandmarkIndex.LIP_RIGHT)
 
-            fun biasedCenter(
-                cx: Float,
-                cy: Float,
+            // Temple anchors (face oval) to push blush toward the hairline like pro placement.
+            val lTx = MakeupGeometry.lmX(lm, 127, mirror, aspectScale)
+            val lTy = MakeupGeometry.lmY(lm, 127)
+            val rTx = MakeupGeometry.lmX(lm, 356, mirror, aspectScale)
+            val rTy = MakeupGeometry.lmY(lm, 356)
+
+            val noseX = MakeupGeometry.lmX(lm, LandmarkIndex.NOSE_TIP, mirror, aspectScale)
+            val noseY = MakeupGeometry.lmY(lm, LandmarkIndex.NOSE_TIP)
+
+            // Outer-eye span is a good face-scale proxy (stable across expressions).
+            val outerEyeSpan = sqrt((lEx - rEx) * (lEx - rEx) + (lEy - rEy) * (lEy - rEy))
+                .coerceIn(0.10f, 1.20f)
+
+            // Cheekbone ridge anchors (higher on the face than "cheek center").
+            // These indices come from the cheek region arrays and sit closer to the zygomatic bone.
+            val leftCheekboneIdx = intArrayOf(123, 116, 117, 118, 101)
+            val rightCheekboneIdx = intArrayOf(352, 346, 347, 348, 330)
+
+            data class BlushPose(
+                val cx: Float,
+                val cy: Float,
+                val axisXx: Float,
+                val axisXy: Float,
+                val axisYx: Float,
+                val axisYy: Float,
+                val base: Float,
+            )
+
+            fun lerp(a: Float, b: Float, t0: Float): Float {
+                val t = t0.coerceIn(0f, 1f)
+                return a + (b - a) * t
+            }
+
+            fun avgPoint(indices: IntArray): Pair<Float, Float> {
+                var sx = 0f
+                var sy = 0f
+                val n = indices.size.coerceAtLeast(1)
+                for (idx in indices) {
+                    sx += MakeupGeometry.lmX(lm, idx, mirror, aspectScale)
+                    sy += MakeupGeometry.lmY(lm, idx)
+                }
+                return Pair(sx / n.toFloat(), sy / n.toFloat())
+            }
+
+            fun blushPose(
+                cx0: Float,
+                cy0: Float,
                 ex: Float,
                 ey: Float,
                 mx: Float,
                 my: Float,
+                tx: Float,
+                ty: Float,
                 rx: Float,
                 ry: Float,
-            ): Pair<Float, Float> {
-                var dx = ex - mx
-                var dy = ey - my
-                val d = sqrt(dx * dx + dy * dy).coerceAtLeast(1e-6f)
-                dx /= d; dy /= d
-                val shift = 0.18f * min(rx, ry)
-                return Pair(cx + dx * shift, cy + dy * shift)
+            ): BlushPose {
+                // Cheekbone axis: mouth corner → temple (sweeps toward hairline like pro placement).
+                // We also compute eye↔mouth span for conservative clamps.
+                val eyeMouthSpan = sqrt((ex - mx) * (ex - mx) + (ey - my) * (ey - my)).coerceAtLeast(1e-6f)
+                var vx = tx - mx
+                var vy = ty - my
+                val mtLen = sqrt(vx * vx + vy * vy).coerceAtLeast(1e-6f)
+                vx /= mtLen; vy /= mtLen
+
+                // Perpendicular "up" (positive NDC y).
+                var upX = -vy
+                var upY = vx
+                if (upY < 0f) { upX = -upX; upY = -upY }
+
+                val base = min(rx, ry).coerceAtLeast(1e-4f)
+
+                // Professional placement (rule-of-thumb encoded with landmarks):
+                // - center should live in the upper-outer cheek quadrant
+                // - sweep toward the temple, but not all the way back to the hairline
+                // - sit above the cheek hollow (avoid drifting toward the mouth/jaw)
+                val along = (mtLen * 0.52f).coerceIn(eyeMouthSpan * 0.42f, eyeMouthSpan * 0.78f)
+                val lift = (eyeMouthSpan * 0.16f).coerceIn(0.010f, 0.095f)
+                var targetCx = mx + vx * along + upX * lift
+                var targetCy = my + vy * along + upY * lift
+
+                // Blend with the cheekbone ridge centroid so placement stays on-bone across face shapes.
+                val blendT = 0.68f
+                var cx = lerp(cx0, targetCx, blendT)
+                var cy = lerp(cy0, targetCy, blendT)
+
+                // Safety clamp: keep blush below the outer eye by a small margin (avoids under-eye placement).
+                // NDC y increases upward, so "below" means <= (eyeY - margin).
+                val eyeMargin = (eyeMouthSpan * 0.11f).coerceIn(0.010f, 0.070f)
+                cy = min(cy, ey - eyeMargin)
+
+                // Keep blush off the "apple" / lower cheek: ensure it stays above mouth corner by a margin.
+                val mouthMarginUp = (eyeMouthSpan * 0.18f).coerceIn(0.012f, 0.090f)
+                cy = maxOf(cy, my + mouthMarginUp)
+
+                // Keep blush away from the nose (classic "two-finger widths from nose" rule).
+                // Push outward along nose→temple direction if it drifts too medial.
+                var outX = tx - noseX
+                var outY = ty - noseY
+                val outLen = sqrt(outX * outX + outY * outY).coerceAtLeast(1e-6f)
+                outX /= outLen; outY /= outLen
+                val minOut = (outerEyeSpan * 0.34f).coerceIn(0.035f, 0.26f)
+                val outProj = (cx - noseX) * outX + (cy - noseY) * outY
+                if (outProj < minOut) {
+                    val push = (minOut - outProj)
+                    cx += outX * push
+                    cy += outY * push * 0.35f // slightly bias upward with the push
+                }
+
+                return BlushPose(
+                    cx = cx,
+                    cy = cy,
+                    axisXx = vx,
+                    axisXy = vy,
+                    axisYx = upX,
+                    axisYy = upY,
+                    base = base,
+                )
             }
 
-            val (lCx, lCy) = biasedCenter(lCx0, lCy0, lEx, lEy, lMx, lMy, lRx, lRy)
-            val (rCx, rCy) = biasedCenter(rCx0, rCy0, rEx, rEy, rMx, rMy, rRx, rRy)
+            val (lBx, lBy) = avgPoint(leftCheekboneIdx)
+            val (rBx, rBy) = avgPoint(rightCheekboneIdx)
+
+            // Fall back to cheek-center if the cheekbone centroid ever degenerates (shouldn't, but safe).
+            val lPose = blushPose(
+                cx0 = if (lBx.isFinite()) lBx else lCx0,
+                cy0 = if (lBy.isFinite()) lBy else lCy0,
+                ex = lEx,
+                ey = lEy,
+                mx = lMx,
+                my = lMy,
+                tx = lTx,
+                ty = lTy,
+                rx = lRx,
+                ry = lRy,
+            )
+            val rPose = blushPose(
+                cx0 = if (rBx.isFinite()) rBx else rCx0,
+                cy0 = if (rBy.isFinite()) rBy else rCy0,
+                ex = rEx,
+                ey = rEy,
+                mx = rMx,
+                my = rMy,
+                tx = rTx,
+                ty = rTy,
+                rx = rRx,
+                ry = rRy,
+            )
 
             GLES20.glUniform1f(mkUBlendMode, 0f)
             GLES20.glUniform1f(mkUGradientDir, 0f)
             GLES20.glUniform1f(mkUEffectKind, 1f)
-            GLES20.glUniform1f(mkUNoiseAmount, 0.12f)
+            // Lower noise: the shader uses it mostly as micro-dither now (cleaner, more pro finish).
+            GLES20.glUniform1f(mkUNoiseAmount, 0.085f)
 
-            setMkColor(style.blushColor, style.blushAlpha * 0.55f)
-            drawGeometry(MakeupGeometry.buildBlushMesh(lCx, lCy, lRx, lRy, segments = 40))
-            drawGeometry(MakeupGeometry.buildBlushMesh(rCx, rCy, rRx, rRy, segments = 40))
+            fun drawBlush(p: BlushPose, radiusScale: Float, alphaScale: Float) {
+                // More "swept" shape: longer along cheekbone, tighter vertically.
+                val radX = (p.base * 2.05f * radiusScale).coerceIn(0.012f, 0.48f)
+                val radY = (p.base * 0.96f * radiusScale).coerceIn(0.008f, 0.30f)
+                setMkColor(style.blushColor, (style.blushAlpha * alphaScale).coerceIn(0f, 0.90f))
+                drawGeometry(
+                    MakeupGeometry.buildRotatedEllipseMesh(
+                        centerX = p.cx,
+                        centerY = p.cy,
+                        radiusX = radX,
+                        radiusY = radY,
+                        axisXx = p.axisXx,
+                        axisXy = p.axisXy,
+                        axisYx = p.axisYx,
+                        axisYy = p.axisYy,
+                        segments = 46,
+                    )
+                )
+            }
+
+            // Main pass (soft-light shader path is more subtle than flat paint, so keep alpha modestly higher).
+            drawBlush(lPose, radiusScale = 1.00f, alphaScale = 0.74f)
+            drawBlush(rPose, radiusScale = 1.00f, alphaScale = 0.74f)
 
             // Second softer pass for depth
-            setMkColor(style.blushColor, style.blushAlpha * 0.24f)
-            drawGeometry(MakeupGeometry.buildBlushMesh(lCx, lCy, lRx * 1.35f, lRy * 1.30f, segments = 40))
-            drawGeometry(MakeupGeometry.buildBlushMesh(rCx, rCy, rRx * 1.35f, rRy * 1.30f, segments = 40))
+            drawBlush(lPose, radiusScale = 1.48f, alphaScale = 0.34f)
+            drawBlush(rPose, radiusScale = 1.48f, alphaScale = 0.34f)
 
             // Reset defaults for subsequent layers.
             GLES20.glUniform1f(mkUEffectKind, 0f)
@@ -1583,25 +1730,6 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             setMkColor(hlColor, style.highlightAlpha * 0.10f)
             drawGeometry(noseFan)
 
-            // Specular stripe down the bridge:
-            // slightly thicker for a pro “soft sheen”, but kept very low opacity.
-            val lInnerX = MakeupGeometry.lmX(lm, LandmarkIndex.LEFT_EYE_INNER, mirror, aspectScale)
-            val lInnerY = MakeupGeometry.lmY(lm, LandmarkIndex.LEFT_EYE_INNER)
-            val rInnerX = MakeupGeometry.lmX(lm, LandmarkIndex.RIGHT_EYE_INNER, mirror, aspectScale)
-            val rInnerY = MakeupGeometry.lmY(lm, LandmarkIndex.RIGHT_EYE_INNER)
-            val innerEyeSpan = sqrt((lInnerX - rInnerX) * (lInnerX - rInnerX) + (lInnerY - rInnerY) * (lInnerY - rInnerY))
-                .coerceIn(0.10f, 1.20f)
-
-            // Twice as wide on the nose (requested): reads as a soft specular band, not a sharp line.
-            val stripeW = (innerEyeSpan * 0.040f).coerceIn(0.0032f, 0.026f)
-            val noseStripeCore = MakeupGeometry.buildStrokeMesh(lm, NOSE_BRIDGE, stripeW, mirror, aspectScale)
-            val noseStripeBloom = MakeupGeometry.buildStrokeMesh(lm, NOSE_BRIDGE, stripeW * 2.30f, mirror, aspectScale)
-
-            setMkColor(hlColor, style.highlightAlpha * 0.10f)
-            drawGeometry(noseStripeCore)
-            setMkColor(hlColor, style.highlightAlpha * 0.03f)
-            drawGeometry(noseStripeBloom)
-
             // Sparkle overlay on highlight regions (additive twinkle).
             if (style.highlightSparkle > 0.01f) {
                 GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE)
@@ -1632,10 +1760,6 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                     alpha = a,
                     doBloom = false,
                 )
-                val noseA = (a * 0.78f).coerceIn(0f, 0.20f)
-
-                setMkColor(sparkleColor, noseA)
-                drawGeometry(noseStripeCore)
 
                 // Restore defaults.
                 GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)

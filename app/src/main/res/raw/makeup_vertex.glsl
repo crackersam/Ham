@@ -9,11 +9,13 @@ attribute vec2 aRegionUV;
 
 varying float vEdgeFactor;
 varying vec2  vRegionUV;
+varying vec2  vNdcPos;
 
 uniform vec2 uCropScale;
 
 void main() {
     vEdgeFactor = aEdgeFactor;
     vRegionUV   = aRegionUV;
-    gl_Position = vec4(aPosition * uCropScale, 0.0, 1.0);
+    vNdcPos = aPosition * uCropScale;
+    gl_Position = vec4(vNdcPos, 0.0, 1.0);
 }

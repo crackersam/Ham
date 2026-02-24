@@ -107,6 +107,9 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var mkUNoiseAmount = 0
     private var mkUTime = -1
     private var mkUCropScale = 0
+    private var mkUCameraTex = -1
+    private var mkUMirror = -1
+    private var mkUSkinLuma = -1
 
     private var noiseTextureId = 0
     private var startTimeNanos: Long = 0L
@@ -304,6 +307,9 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         mkUNoiseAmount = GLES20.glGetUniformLocation(mkProg, "uNoiseAmount")
         mkUTime = GLES20.glGetUniformLocation(mkProg, "uTime")
         mkUCropScale = GLES20.glGetUniformLocation(mkProg, "uCropScale")
+        mkUCameraTex = GLES20.glGetUniformLocation(mkProg, "uCameraTex")
+        mkUMirror = GLES20.glGetUniformLocation(mkProg, "uMirror")
+        mkUSkinLuma = GLES20.glGetUniformLocation(mkProg, "uSkinLuma")
 
         // Full-screen quad: position(xy) + texCoord(uv).
         //
@@ -636,6 +642,19 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
         GLES20.glUseProgram(mkProg)
         GLES20.glUniform2f(mkUCropScale, cropScaleX, cropScaleY)
+
+        // Bind the camera texture for per-pixel adaptation in the makeup shader
+        // (contour uses this to suppress beard/cast-shadow artefacts).
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, camTextureId)
+        if (mkUCameraTex >= 0) GLES20.glUniform1i(mkUCameraTex, 0)
+        if (mkUMirror >= 0) GLES20.glUniform1f(mkUMirror, if (mirror) 1f else 0f)
+        if (mkUSkinLuma >= 0) {
+            val skinLuma = (effTint.red * 0.2126f + effTint.green * 0.7152f + effTint.blue * 0.0722f)
+                .coerceIn(0f, 1f)
+            GLES20.glUniform1f(mkUSkinLuma, skinLuma)
+        }
+
         if (mkUTime >= 0) {
             val t = (System.nanoTime() - startTimeNanos).toFloat() / 1_000_000_000f
             GLES20.glUniform1f(mkUTime, t)
@@ -652,6 +671,13 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         // ── Contour (cheek shading) ───────────────────────────────────────────
         // Subtle under-cheekbone shadow that sits beneath blush.
         if (style.contourAlpha > 0.01f) {
+            // Moderate visibility boost applied consistently across all contour regions.
+            // Keeps existing layering ratios (core > diffusion > bloom) but makes the
+            // result more legible on typical phone exposure.
+            val contourBoost = 1.15f
+            fun contourAlpha(scale: Float) =
+                (style.contourAlpha * scale * contourBoost).coerceIn(0f, 0.85f)
+
             // True multiply composite:
             // dst.rgb = src.rgb * dst.rgb  (where src.rgb is a shadow *factor*)
             // alpha remains conventional for capture/readback.
@@ -665,29 +691,56 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             GLES20.glUniform1f(mkUGradientDir, 0f)
             GLES20.glUniform1f(mkUEffectKind, 3f) // contour shadow
             GLES20.glUniform1f(mkUNoiseScale, 24.0f)
-            GLES20.glUniform1f(mkUNoiseAmount, 0.06f)
+            // Slightly smoother than before (more "blended powder" than grain).
+            GLES20.glUniform1f(mkUNoiseAmount, 0.035f)
 
             // Contour is composited via true multiply, so the "color" here is a *factor*:
             // 1.0 means no change; lower values mean deeper shadow. Calibrate from foundation tint
             // to avoid muddy/orange contour and to keep results consistent across skin tones.
             fun contourFactorColor(tint: Color, depth: Float): Color {
                 val d = depth.coerceIn(0f, 1f)
-                val r0 = tint.red.coerceIn(0f, 1f)
-                val g0 = tint.green.coerceIn(0f, 1f)
-                val b0 = tint.blue.coerceIn(0f, 1f)
+                val r0raw = tint.red.coerceIn(0f, 1f)
+                val g0raw = tint.green.coerceIn(0f, 1f)
+                val b0raw = tint.blue.coerceIn(0f, 1f)
+                val lumaRaw = r0raw * 0.2126f + g0raw * 0.7152f + b0raw * 0.0722f
+
+                // If the skin-tint estimate is darker than a realistic mid-tone (e.g. pulled
+                // down by beard/shadow pixels), lift all channels proportionally so the shadow
+                // model always operates in a valid skin range and never produces muddy dark lines.
+                val lumaFloor = 0.30f
+                val lift = if (lumaRaw > 1e-6f && lumaRaw < lumaFloor) lumaFloor / lumaRaw else 1f
+                val r0 = (r0raw * lift).coerceIn(0f, 1f)
+                val g0 = (g0raw * lift).coerceIn(0f, 1f)
+                val b0 = (b0raw * lift).coerceIn(0f, 1f)
                 val luma = r0 * 0.2126f + g0 * 0.7152f + b0 * 0.0722f
 
-                // Base factor (higher = gentler). Slightly gentler on deeper skin (higher luma doesn't necessarily mean lighter in camera,
-                // but this is a good heuristic for keeping contour from crushing).
-                val base = (0.93f - 0.17f * d + (luma - 0.5f) * 0.05f).coerceIn(0.66f, 0.96f)
+                // Neutral taupe shadow model (stable, avoids grey lines on light skin):
+                // - control overall darkening via a single strength term
+                // - apply a subtle channel bias: blue darkens slightly more than red
+                // - add a light-skin boost to preserve chroma so it reads as shadow, not graphite
+                val strength0 = (0.090f + 0.145f * d).coerceIn(0.05f, 0.25f)
+                // Slightly reduce contour strength in deeper skin so we don’t crush.
+                val lumaScale = (1.03f - 0.22f * (luma - 0.5f)).coerceIn(0.82f, 1.12f)
+                val strength = (strength0 * lumaScale).coerceIn(0.02f, 0.20f)
 
-                // Warmth heuristic; warmer foundation gets a slightly cooler (less red) shadow.
-                val warmth = (r0 - b0).coerceIn(-0.40f, 0.40f)
-                val coolShift = (0.028f + 0.050f * warmth.coerceAtLeast(0f)) * d
+                val warmth = (r0 - b0).coerceIn(-0.30f, 0.30f)
+                val w = (warmth / 0.30f).coerceIn(-1f, 1f)
+                val light = ((luma - 0.44f) / 0.36f).coerceIn(0f, 1f) // 0 mid → 1 very light
 
-                val rf = (base * (1f - 0.060f * d - 0.70f * coolShift)).coerceIn(0.62f, 0.97f)
-                val gf = (base * (1f - 0.030f * d)).coerceIn(0.62f, 0.98f)
-                val bf = (base * (1f + 0.022f * d + coolShift)).coerceIn(0.62f, 0.99f)
+                // Scale factors: >1 darkens more for that channel.
+                // Warm shadow bias: darken blue significantly more than red so
+                // the shadow reads as taupe/brown rather than grey on light skin.
+                var rScale = 0.72f + 0.04f * w - 0.04f * light
+                var gScale = 0.98f + 0.01f * w + 0.01f * light
+                var bScale = 1.32f - 0.08f * w + 0.28f * light
+
+                rScale = rScale.coerceIn(0.60f, 1.00f)
+                gScale = gScale.coerceIn(0.75f, 1.10f)
+                bScale = bScale.coerceIn(1.00f, 1.65f)
+
+                val rf = (1f - strength * rScale).coerceIn(0.60f, 0.995f)
+                val gf = (1f - strength * gScale).coerceIn(0.58f, 0.995f)
+                val bf = (1f - strength * bScale).coerceIn(0.50f, 0.990f)
                 return Color(rf, gf, bf, 1f)
             }
 
@@ -748,8 +801,10 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 val downY = -upY
 
                 val base = min(rx, ry).coerceAtLeast(1e-4f)
-                val along = 0.10f * base
-                val down  = 0.12f * base
+                // Slightly higher placement reads more like pro cheekbone sculpt,
+                // and avoids dragging shadow too far down toward the mouth/jaw.
+                val along = 0.12f * base
+                val down  = 0.085f * base
                 return ContourPose(
                     cx = cx + vx * along + downX * down,
                     cy = cy + vy * along + downY * down,
@@ -767,11 +822,13 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             val rPose = contourPose(rCx0, rCy0, rEx, rEy, rMx, rMy, rRx, rRy)
 
             fun drawContour(pose: ContourPose, rx: Float, ry: Float) {
-                val radX = (rx * 1.65f).coerceIn(0.008f, 0.40f)
-                val radY = (ry * 0.55f).coerceIn(0.006f, 0.28f)
+                // Shorten the cheek contour along the eye↔mouth axis so it
+                // doesn’t read as a connecting line under some lighting.
+                val radX = (rx * 1.58f).coerceIn(0.008f, 0.40f)
+                val radY = (ry * 0.66f).coerceIn(0.006f, 0.28f)
 
-                // Pass 1: denser band
-                setMkColor(contourCore, style.contourAlpha * 0.55f)
+                // Pass A: main cheek shadow (single field; shader handles shaping/bias)
+                setMkColor(contourCore, contourAlpha(0.62f))
                 drawGeometry(
                     MakeupGeometry.buildRotatedEllipseMesh(
                         centerX = pose.cx,
@@ -786,14 +843,32 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                     )
                 )
 
-                // Pass 2: wider, softer diffusion slightly lower (toward jaw)
-                setMkColor(contourSoft, style.contourAlpha * 0.28f)
+                // Pass B: larger, ultra-soft diffusion tail (removes any visible boundary)
+                setMkColor(contourSoft, contourAlpha(0.20f))
                 drawGeometry(
                     MakeupGeometry.buildRotatedEllipseMesh(
-                        centerX = pose.cx + pose.downX * (0.06f * pose.base),
-                        centerY = pose.cy + pose.downY * (0.06f * pose.base),
-                        radiusX = radX * 1.30f,
-                        radiusY = radY * 1.18f,
+                        // Blend upward/outer into the cheekbone and inward softly.
+                        centerX = pose.cx - pose.downX * (0.07f * pose.base),
+                        centerY = pose.cy - pose.downY * (0.07f * pose.base),
+                        radiusX = radX * 1.55f,
+                        radiusY = radY * 1.35f,
+                        axisXx = pose.axisXx,
+                        axisXy = pose.axisXy,
+                        axisYx = pose.axisYx,
+                        axisYy = pose.axisYy,
+                        segments = 44,
+                    )
+                )
+
+                // Pass C: ultra-soft airbrush veil to specifically kill any remaining
+                // long-axis “connector” perception under harsh lighting.
+                setMkColor(contourSoft, contourAlpha(0.11f))
+                drawGeometry(
+                    MakeupGeometry.buildRotatedEllipseMesh(
+                        centerX = pose.cx - pose.downX * (0.12f * pose.base),
+                        centerY = pose.cy - pose.downY * (0.12f * pose.base),
+                        radiusX = radX * 1.95f,
+                        radiusY = radY * 1.65f,
                         axisXx = pose.axisXx,
                         axisXy = pose.axisXy,
                         axisYx = pose.axisYx,
@@ -833,7 +908,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 val ry = (eyeSpan * 0.12f).coerceIn(0.008f, 0.20f)
 
                 // Core
-                setMkColor(contourSoft, style.contourAlpha * 0.24f)
+                setMkColor(contourSoft, contourAlpha(0.24f))
                 drawGeometry(
                     MakeupGeometry.buildRotatedEllipseMesh(
                         centerX = cx,
@@ -848,7 +923,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                     )
                 )
                 // Bloom
-                setMkColor(contourSoft, style.contourAlpha * 0.12f)
+                setMkColor(contourSoft, contourAlpha(0.14f))
                 drawGeometry(
                     MakeupGeometry.buildRotatedEllipseMesh(
                         centerX = cx + upX * (eyeSpan * 0.02f),
@@ -867,6 +942,70 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             drawTemple(lEx, lEy, lTempleX, lTempleY)
             drawTemple(rEx, rEy, rTempleX, rTempleY)
 
+            // ── Forehead / hairline contour (reference-photo style) ───────────
+            // A soft ribbon along the hairline that fades inward.
+            val (ovalRx, ovalRy) = MakeupGeometry.landmarkBoundingRadius(lm, FACE_OVAL, mirror, aspectScale)
+            val faceBase = min(ovalRx, ovalRy).coerceIn(0.06f, 0.90f)
+
+            val centerX = MakeupGeometry.lmX(lm, LandmarkIndex.NOSE_TIP, mirror, aspectScale)
+            val centerY = MakeupGeometry.lmY(lm, LandmarkIndex.NOSE_TIP)
+
+            // Forehead arc from left temple → top center → right temple.
+            val foreheadIdx = intArrayOf(
+                127, 162, 21, 54, 103, 67, 109, 10, 338, 297, 332, 284, 251, 389, 356,
+            )
+
+            fun insetForehead(amount: Float): FloatArray {
+                val pts = FloatArray(foreheadIdx.size * 2)
+                for (i in foreheadIdx.indices) {
+                    val x0 = MakeupGeometry.lmX(lm, foreheadIdx[i], mirror, aspectScale)
+                    val y0 = MakeupGeometry.lmY(lm, foreheadIdx[i])
+                    var vx = centerX - x0
+                    var vy = centerY - y0
+                    val vLen = sqrt(vx * vx + vy * vy).coerceAtLeast(1e-6f)
+                    vx /= vLen; vy /= vLen
+                    pts[i * 2] = x0 + vx * amount
+                    pts[i * 2 + 1] = y0 + vy * amount
+                }
+                return pts
+            }
+
+            // Slight inset so we never paint outside the face oval; thickness scales with face size.
+            val hairOuterInset = (faceBase * 0.012f).coerceIn(0.0015f, 0.020f)
+            val hairInnerInset = (faceBase * 0.14f).coerceIn(0.010f, 0.12f)
+
+            // Hint contour shader to treat this as a ribbon (no radial falloff).
+            GLES20.glUniform1f(mkUGradientDir, 2f)
+
+            val hairOuter = insetForehead(hairOuterInset)
+            val hairInner = insetForehead(hairInnerInset)
+            setMkColor(contourSoft, contourAlpha(0.08f))
+            drawGeometry(
+                MakeupGeometry.buildRibbonMesh2D(
+                    outerPts = hairOuter,
+                    innerPts = hairInner,
+                    outerEdgeFactor = 1f,
+                    innerEdgeFactor = 0f,
+                    outerV = 1f,
+                    innerV = 0f,
+                )
+            )
+
+            // Wider, softer diffusion to match the reference's melt-in.
+            val hairOuter2 = insetForehead((hairOuterInset * 0.55f).coerceAtLeast(0.001f))
+            val hairInner2 = insetForehead((hairInnerInset * 1.45f).coerceAtMost(faceBase * 0.24f))
+            setMkColor(contourSoft, contourAlpha(0.04f))
+            drawGeometry(
+                MakeupGeometry.buildRibbonMesh2D(
+                    outerPts = hairOuter2,
+                    innerPts = hairInner2,
+                    outerEdgeFactor = 1f,
+                    innerEdgeFactor = 0f,
+                    outerV = 1f,
+                    innerV = 0f,
+                )
+            )
+
             // ── Jawline contour ──────────────────────────────────────────────
             // Feather from the jaw edge upward into the face (avoid painting outside the face).
             val jawIdx = intArrayOf(
@@ -874,13 +1013,8 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 152,
                 148, 176, 149, 150, 136, 172, 58, 132, 93, 234,
             )
-            val (ovalRx, ovalRy) = MakeupGeometry.landmarkBoundingRadius(lm, FACE_OVAL, mirror, aspectScale)
-            val faceBase = min(ovalRx, ovalRy).coerceIn(0.06f, 0.90f)
             val outerInset = (faceBase * 0.06f).coerceIn(0.004f, 0.050f)
             val innerInset = (faceBase * 0.18f).coerceIn(0.008f, 0.120f)
-
-            val centerX = MakeupGeometry.lmX(lm, LandmarkIndex.NOSE_TIP, mirror, aspectScale)
-            val centerY = MakeupGeometry.lmY(lm, LandmarkIndex.NOSE_TIP)
 
             fun insetJaw(amount: Float): FloatArray {
                 val pts = FloatArray(jawIdx.size * 2)
@@ -902,7 +1036,8 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
             val jawOuter = insetJaw(outerInset)
             val jawInner = insetJaw(innerInset)
-            setMkColor(contourSoft, style.contourAlpha * 0.20f)
+            // Keep jaw contour very subtle; it should frame, not draw a line.
+            setMkColor(contourSoft, contourAlpha(0.10f))
             drawGeometry(
                 MakeupGeometry.buildRibbonMesh2D(
                     outerPts = jawOuter,
@@ -914,10 +1049,10 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 )
             )
 
-            // Wider, softer diffusion.
-            val jawOuter2 = insetJaw((outerInset * 0.55f).coerceAtLeast(0.002f))
-            val jawInner2 = insetJaw((innerInset * 1.25f).coerceAtMost(faceBase * 0.28f))
-            setMkColor(contourSoft, style.contourAlpha * 0.10f)
+            // Wider, softer diffusion upward into the face (pro blended finish).
+            val jawOuter2 = insetJaw((outerInset * 0.40f).coerceAtLeast(0.0018f))
+            val jawInner2 = insetJaw((innerInset * 1.55f).coerceAtMost(faceBase * 0.33f))
+            setMkColor(contourSoft, contourAlpha(0.045f))
             drawGeometry(
                 MakeupGeometry.buildRibbonMesh2D(
                     outerPts = jawOuter2,
@@ -970,13 +1105,13 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             // Side shadows (core + bloom)
             val leftBridge = buildBridgeLine(-1f)
             val rightBridge = buildBridgeLine(1f)
-            setMkColor(contourSoft, style.contourAlpha * 0.14f)
+            setMkColor(contourSoft, contourAlpha(0.11f))
             drawGeometry(MakeupGeometry.buildStrokeMesh2D(leftBridge, strokeW))
             drawGeometry(MakeupGeometry.buildStrokeMesh2D(rightBridge, strokeW))
 
-            setMkColor(contourSoft, style.contourAlpha * 0.07f)
-            drawGeometry(MakeupGeometry.buildStrokeMesh2D(leftBridge, strokeW * 1.55f))
-            drawGeometry(MakeupGeometry.buildStrokeMesh2D(rightBridge, strokeW * 1.55f))
+            setMkColor(contourSoft, contourAlpha(0.055f))
+            drawGeometry(MakeupGeometry.buildStrokeMesh2D(leftBridge, strokeW * 1.75f))
+            drawGeometry(MakeupGeometry.buildStrokeMesh2D(rightBridge, strokeW * 1.75f))
 
             // Under-tip shadow (tiny rotated ellipse)
             val tipX = MakeupGeometry.lmX(lm, LandmarkIndex.NOSE_TIP, mirror, aspectScale)
@@ -992,13 +1127,13 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             val underCy = tipY + noseDy * (innerEyeSpan * 0.040f)
             val underRx = (innerEyeSpan * 0.060f).coerceIn(0.004f, 0.030f)
             val underRy = (innerEyeSpan * 0.030f).coerceIn(0.003f, 0.020f)
-            setMkColor(contourSoft, style.contourAlpha * 0.09f)
+            setMkColor(contourSoft, contourAlpha(0.075f))
             drawGeometry(
                 MakeupGeometry.buildRotatedEllipseMesh(
                     centerX = underCx,
                     centerY = underCy,
-                    radiusX = underRx,
-                    radiusY = underRy,
+                    radiusX = underRx * 1.18f,
+                    radiusY = underRy * 1.22f,
                     axisXx = acrossX,
                     axisXy = acrossY,
                     axisYx = upX,
@@ -1621,7 +1756,16 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         // Require enough landmarks.
         if (lm.size < (LandmarkIndex.RIGHT_CHEEK_CENTER * 3 + 2)) return
 
-        fun sampleAround(idx: Int, radiusPx: Int, stepPx: Int, out: FloatArray): Int {
+        fun sampleAround(
+            idx: Int,
+            radiusPx: Int,
+            stepPx: Int,
+            out: FloatArray,
+            yMaxNorm: Float = 1f,
+            lumaMin: Float = 0.10f,
+            lumaMax: Float = 0.90f,
+            satMax: Float = 0.35f,
+        ): Int {
             val nx = lm[idx * 3].coerceIn(0f, 1f)
             val ny = lm[idx * 3 + 1].coerceIn(0f, 1f)
             val cx = (nx * (width - 1)).toInt()
@@ -1636,6 +1780,11 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 while (dx <= radiusPx) {
                     val x = (cx + dx).coerceIn(0, width - 1)
                     val y = (cy + dy).coerceIn(0, height - 1)
+                    val yNorm = y.toFloat() / (height - 1).toFloat()
+                    if (yNorm > yMaxNorm) {
+                        dx += stepPx
+                        continue
+                    }
                     val base = (y * width + x) * 4
                     val r = (rgba.get(base).toInt() and 0xFF) / 255f
                     val g = (rgba.get(base + 1).toInt() and 0xFF) / 255f
@@ -1646,7 +1795,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                     val mx = maxOf(r, g, b)
                     val mn = minOf(r, g, b)
                     val sat = mx - mn
-                    if (luma in 0.10f..0.90f && sat <= 0.35f) {
+                    if (luma in lumaMin..lumaMax && sat <= satMax) {
                         sumR += r; sumG += g; sumB += b
                         n++
                     }
@@ -1663,24 +1812,85 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
         val radius = (min(width, height) / 180).coerceIn(2, 7)
         val step = maxOf(1, radius / 2)
-        val accum = floatArrayOf(0f, 0f, 0f)
-        var count = 0
+        val accumUpper = floatArrayOf(0f, 0f, 0f)
+        var countUpper = 0
+        val accumCheek = floatArrayOf(0f, 0f, 0f)
+        var countCheek = 0
 
-        // Sample safe skin zones (avoid eyes/lips): cheeks + mid-forehead anchors.
-        count += sampleAround(LandmarkIndex.LEFT_CHEEK_CENTER, radius, step, accum)
-        count += sampleAround(LandmarkIndex.RIGHT_CHEEK_CENTER, radius, step, accum)
+        // Beard-robust skin tint estimate:
+        // - Upper-face reference (forehead + bridge) is least affected by beard/stubble.
+        // - Cheek samples can be pulled darker/cooler by facial hair; use them only when
+        //   they agree with the upper-face reference.
+        //
+        // yMaxNorm gates out the lower face where beard shadow dominates.
+        // Sample a couple of upper-nose / bridge anchors (less likely to include moustache shadow than the tip).
+        countUpper += sampleAround(6, radius, step, accumUpper, yMaxNorm = 0.60f, satMax = 0.33f)
+        countUpper += sampleAround(197, radius, step, accumUpper, yMaxNorm = 0.60f, satMax = 0.33f)
         for (idx in FOREHEAD_CENTER) {
-            count += sampleAround(idx, radius, step, accum)
+            countUpper += sampleAround(idx, radius, step, accumUpper, yMaxNorm = 0.56f, satMax = 0.33f)
         }
 
-        if (count < 18) return
-        val inv = 1f / count.toFloat()
-        val estimate = Color(
-            red = (accum[0] * inv).coerceIn(0.02f, 0.98f),
-            green = (accum[1] * inv).coerceIn(0.02f, 0.98f),
-            blue = (accum[2] * inv).coerceIn(0.02f, 0.98f),
-            alpha = 1f,
+        // Cheeks (optional contribution). Allow slightly lower y but still avoid lower-face beard zone.
+        // We apply a *reference-based luma floor* (computed below) so dark beard/stubble pixels
+        // are rejected even if they’re low-saturation and would otherwise look “skin-like”.
+        // (This is intentionally aggressive per user request.)
+        // Note: lumaMin is filled in after we compute the upper-face reference.
+
+        fun colorFrom(accum: FloatArray, count: Int): Color {
+            val inv = 1f / count.toFloat()
+            return Color(
+                red = (accum[0] * inv).coerceIn(0.02f, 0.98f),
+                green = (accum[1] * inv).coerceIn(0.02f, 0.98f),
+                blue = (accum[2] * inv).coerceIn(0.02f, 0.98f),
+                alpha = 1f,
+            )
+        }
+
+        if (countUpper < 14) return
+
+        val upper = colorFrom(accumUpper, countUpper)
+
+        fun luma(c: Color) = c.red * 0.2126f + c.green * 0.7152f + c.blue * 0.0722f
+
+        val uL = luma(upper)
+        val cheekLumaMin = maxOf(0.10f, (uL - 0.08f).coerceIn(0f, 1f))
+        // Now sample cheeks with the aggressive luma floor + tighter y gate.
+        countCheek += sampleAround(
+            LandmarkIndex.LEFT_CHEEK_CENTER,
+            radius,
+            step,
+            accumCheek,
+            yMaxNorm = 0.66f,
+            lumaMin = cheekLumaMin,
+            satMax = 0.33f,
         )
+        countCheek += sampleAround(
+            LandmarkIndex.RIGHT_CHEEK_CENTER,
+            radius,
+            step,
+            accumCheek,
+            yMaxNorm = 0.66f,
+            lumaMin = cheekLumaMin,
+            satMax = 0.33f,
+        )
+
+        val estimate = if (countCheek >= 14) {
+            val cheek = colorFrom(accumCheek, countCheek)
+            val cL = luma(cheek)
+            // If cheeks still come out darker than upper-face reference, treat it as beard/shadow contamination
+            // and snap strongly toward upper-face.
+            val delta = (uL - cL).coerceIn(0f, 0.20f)
+            val beard = ((delta - 0.008f) / 0.035f).coerceIn(0f, 1f) // more sensitive than before
+            if (beard > 0.25f) {
+                upper
+            } else {
+                val upperW = (0.70f + 0.25f * beard).coerceIn(0f, 0.95f)
+                mixColor(cheek, upper, upperW)
+            }
+        } else {
+            // If cheeks are too sparse after filtering, rely entirely on upper-face.
+            upper
+        }
 
         val prev = skinTintEma
         skinTintEma = if (prev == null) {

@@ -17,6 +17,11 @@ uniform float uAutoRadiusScale;  // wide local-average radius scale
 uniform float uDebugFoundation; // 0 = normal, 1 = debug face mask
 uniform vec3  uDebugColor;      // debug mask tint color
 
+// Optional contour mask (packed low-res RGBA). When provided, we reduce smoothing
+// in contoured regions so the shadow reads crisp and doesn’t “melt” into blur.
+uniform sampler2D uContourMaskTex;
+uniform float uContourSmoothReduce; // 0..1 (e.g. 0.35)
+
 varying float vEdgeFactor;
 varying vec2  vCamUV;
 
@@ -216,6 +221,16 @@ void main() {
                         * (0.55 + 0.85 * foundStrength)
                         * (0.35 + 0.65 * skinLikely)
                         * keepDetail;
+
+        // Mask-aware smoothing: reduce blur where contour mask is strong.
+        // foundation vCamUV uses camera convention (v=0 at top), contour mask uses GL convention (v=0 at bottom).
+        if (uContourSmoothReduce > 0.001) {
+            vec2 muv = vec2(vCamUV.x, 1.0 - vCamUV.y);
+            vec4 cm = texture2D(uContourMaskTex, clamp(muv, vec2(0.0), vec2(1.0)));
+            float mContour = clamp(cm.r * 0.95 + cm.g * 0.55, 0.0, 1.0);
+            smoothAmt *= (1.0 - clamp(uContourSmoothReduce, 0.0, 1.0) * mContour);
+        }
+
         color = mix(color, blurred, clamp(smoothAmt, 0.0, 1.0) * 0.98);
         luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
     }
@@ -322,10 +337,11 @@ void main() {
     // Keeps per-style control but avoids a “no visible change” outcome on-device.
     float foundAlpha = clamp(uFoundAlpha * 2.6, 0.0, 1.0);
     float autoAlpha  = clamp(uAutoCorrect * 3.0, 0.0, 1.0);
+    float smoothAlpha = clamp(uSmooth * 1.8, 0.0, 1.0);
     // Concealer-only draws set uFoundAlpha/uAutoCorrect to 0, so include concealer strength
     // in the alpha budget or the pass will discard.
     float concealAlpha = clamp(max(uConcealLift, uConcealNeutralize) * 1.8, 0.0, 1.0);
-    float finalAlpha = max(max(foundAlpha, autoAlpha), concealAlpha) * edgeAlpha;
+    float finalAlpha = max(max(max(foundAlpha, autoAlpha), concealAlpha), smoothAlpha) * edgeAlpha;
     if (finalAlpha < 0.003) discard;
 
     if (uDebugFoundation > 2.5) {

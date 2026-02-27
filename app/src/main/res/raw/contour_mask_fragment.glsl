@@ -9,6 +9,7 @@ uniform float uFaceWidthPx; // face width in mask pixels (for absolute tuning)
 uniform sampler2D uFaceMaskTex; // face/skin clip mask (alpha in .r)
 uniform vec2 uFaceMaskSize;     // (w,h) pixels of face mask texture
 uniform float uErodePx;         // inward erosion radius in pixels (faceWidthPx * 0.01)
+uniform mat3 uUvTransform;      // shared UV transform (identity unless overridden)
 
 uniform vec2 uCheekPts[6];     // 3 per side (temple -> cheekbone -> medial cheek), NDC
 uniform vec2 uJawPts[10];      // ear -> chin -> ear (downsampled), NDC
@@ -198,6 +199,9 @@ void main() {
     vec2 pNdc = vNdcPos;
     vec2 pPx = ndcToPx(pNdc);
 
+    vec2 uv = (uUvTransform * vec3(vTexCoord, 1.0)).xy;
+    uv = clamp(uv, vec2(0.0), vec2(1.0));
+
     float sigma = uSigmaPx;
     // Packed RGBA mask output:
     // - R: contourCore (narrow, stronger)
@@ -216,8 +220,8 @@ void main() {
         //   (ear/temple → outer eye corner → mid-cheek).
         // - Strongest near ear, fades to zero before the nose.
         // - Clean gradients (no texture-driven shading).
-        float coreBlur = uFaceWidthPx * 0.008;
-        float blendBlur = uFaceWidthPx * 0.015;
+        float coreBlur = uFaceWidthPx * 0.006;
+        float blendBlur = uFaceWidthPx * 0.010;
 
         // Keep mask "energy" separated: core vs blend are packed into different channels.
         // Overall strengths are applied in the full-res relighting pass.
@@ -233,13 +237,13 @@ void main() {
         // Use a soft sign gate centered at the ridge so strongest shading stays near the cheekbone.
         // segmentSignedInfoPx returns signedDist > 0 on the "up" side.
         // Softer ridge gate reduces patchiness and prevents hard "stripe" transitions.
-        float belowSoftCore = max(uFaceWidthPx * 0.010, 1.20);
-        float belowSoftBlend = max(uFaceWidthPx * 0.018, 1.70);
+        float belowSoftCore = max(uFaceWidthPx * 0.009, 1.10);
+        float belowSoftBlend = max(uFaceWidthPx * 0.015, 1.50);
         float belowL_core = smoothstep(-belowSoftCore, belowSoftCore, -sdL);
         float belowL_blend = smoothstep(-belowSoftBlend, belowSoftBlend, -sdL);
 
         // Contour centerline is offset slightly BELOW the cheekbone curve.
-        float contourOffsetPx = clamp(uFaceWidthPx * 0.010, 1.4, 14.0);
+        float contourOffsetPx = clamp(uFaceWidthPx * 0.0085, 1.2, 12.0);
         float dL = abs(sdL + contourOffsetPx);
 
         // Cheek visibility profile (TikTok/IG style):
@@ -252,8 +256,8 @@ void main() {
             (1.0 - smoothstep(0.38, 0.86, tL));
         cheekProfileL = max(cheekProfileL, 0.02);
         float taperL = smoothstep(0.00, 1.00, tL); // 0 at ear -> 1 toward outer eye
-        float coreHalfWidthL = mix(uFaceWidthPx * 0.018, uFaceWidthPx * 0.012, taperL);
-        float blendHalfWidthL = mix(uFaceWidthPx * 0.034, uFaceWidthPx * 0.022, taperL);
+        float coreHalfWidthL = mix(uFaceWidthPx * 0.013, uFaceWidthPx * 0.009, taperL);
+        float blendHalfWidthL = mix(uFaceWidthPx * 0.024, uFaceWidthPx * 0.016, taperL);
 
         float coreTL = stripFalloff(dL, coreHalfWidthL, coreBlur, 0.0) * cheekProfileL;
         float blendTL = stripFalloff(dL, blendHalfWidthL, blendBlur, 0.0) * cheekProfileL;
@@ -263,7 +267,7 @@ void main() {
         // Highlight (paired ridge) directly ABOVE the contour (under-eye → temple).
         // Place it at a fixed signed offset on the "up" side of the cheekbone line.
         // Stronger lift highlight: slightly higher offset above the contour ridge.
-        float hlOffsetPx = clamp(uFaceWidthPx * 0.012, 1.6, 14.0);
+        float hlOffsetPx = clamp(uFaceWidthPx * 0.010, 1.3, 12.0);
         float dHlL = abs(sdL - hlOffsetPx);
 
         // Per requirements: highlight widths thinner than contour.
@@ -309,8 +313,8 @@ void main() {
             (1.0 - smoothstep(0.38, 0.86, tR));
         cheekProfileR = max(cheekProfileR, 0.02);
         float taperR = smoothstep(0.00, 1.00, tR);
-        float coreHalfWidthR = mix(uFaceWidthPx * 0.018, uFaceWidthPx * 0.012, taperR);
-        float blendHalfWidthR = mix(uFaceWidthPx * 0.034, uFaceWidthPx * 0.022, taperR);
+        float coreHalfWidthR = mix(uFaceWidthPx * 0.013, uFaceWidthPx * 0.009, taperR);
+        float blendHalfWidthR = mix(uFaceWidthPx * 0.024, uFaceWidthPx * 0.016, taperR);
 
         float coreTR = stripFalloff(dR, coreHalfWidthR, coreBlur, 0.0) * cheekProfileR;
         float blendTR = stripFalloff(dR, blendHalfWidthR, blendBlur, 0.0) * cheekProfileR;
@@ -351,8 +355,8 @@ void main() {
         float downPx = max(jawCPx.y - pPx.y, 0.0);
         float neckFade = gaussian(downPx, max(uFaceWidthPx * 0.035, 2.0));
 
-        float halfW = max(uFaceWidthPx * 0.010, 1.15);
-        float blurPx = max(uFaceWidthPx * 0.012, 1.25);
+        float halfW = max(uFaceWidthPx * 0.0085, 1.05);
+        float blurPx = max(uFaceWidthPx * 0.010, 1.10);
         float m = stripFalloff(d, halfW, blurPx, 0.0) * belowJaw * neckFade;
 
         float side = smoothstep(0.10, 0.55, abs(pNdc.x - uFaceCenter.x));
@@ -498,14 +502,14 @@ void main() {
     // ── Face clip + clean edge fade (NO BLEED) ───────────────────────────────
     // 1) Strict eroded mask: hard stop for background bleed (keep)
     // 2) Extra fade based on distance-to-boundary estimate (prevents hard edges near silhouette)
-    float faceEroded = erodedFaceMask(vTexCoord);
-    float faceRaw = texture2D(uFaceMaskTex, vTexCoord).r;
+    float faceEroded = erodedFaceMask(uv);
+    float faceRaw = texture2D(uFaceMaskTex, uv).r;
 
     vec2 texel = vec2(1.0) / max(uFaceMaskSize, vec2(1.0));
-    float ax = texture2D(uFaceMaskTex, vTexCoord + vec2(texel.x, 0.0)).r
-             - texture2D(uFaceMaskTex, vTexCoord - vec2(texel.x, 0.0)).r;
-    float ay = texture2D(uFaceMaskTex, vTexCoord + vec2(0.0, texel.y)).r
-             - texture2D(uFaceMaskTex, vTexCoord - vec2(0.0, texel.y)).r;
+    float ax = texture2D(uFaceMaskTex, uv + vec2(texel.x, 0.0)).r
+             - texture2D(uFaceMaskTex, uv - vec2(texel.x, 0.0)).r;
+    float ay = texture2D(uFaceMaskTex, uv + vec2(0.0, texel.y)).r
+             - texture2D(uFaceMaskTex, uv - vec2(0.0, texel.y)).r;
     float grad = max(length(vec2(ax, ay)) * 0.5, 1e-4);
     // Approx distance in pixels to the face boundary (alpha~0.5 is the edge).
     float distToFaceBoundary = max((faceRaw - 0.5) / grad, 0.0);

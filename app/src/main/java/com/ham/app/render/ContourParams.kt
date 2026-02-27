@@ -8,7 +8,7 @@ enum class ContourBlendMode { MULTIPLY, SOFT_LIGHT }
  * Contour pipeline parameters.
  *
  * This matches the requested rendering stack:
- * mask(per-region) → gradient → blur → multiply/softlight composite.
+ * mask(per-region) → blur → relight composite.
  */
 data class ContourParams(
     // Master enable/intensity (0..1). This multiplies all region strengths.
@@ -21,10 +21,11 @@ data class ContourParams(
 
     // Per-region strengths (0..1), tuned to be instantly visible but still blended.
     // Defaults are the requested starting values.
-    val cheekContour: Float = 0.60f,
-    val jawContour: Float = 0.50f,
-    val noseContour: Float = 0.40f,
-    val chinContour: Float = 0.50f,
+    val cheekContour: Float = 0.35f,
+    val jawContour: Float = 0.25f,
+    val noseContour: Float = 0.15f,
+    // Temples / hairline shading (subtle; helps “pro sculpt” read, esp. bridal glow).
+    val foreheadContour: Float = 0.20f,
 
     // Blur strength multiplier applied to the face-scaled blur radius.
     val softness: Float = 1.0f,

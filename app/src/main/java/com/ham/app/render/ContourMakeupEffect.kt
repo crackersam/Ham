@@ -46,6 +46,7 @@ class ContourMakeupEffect(private val context: Context) {
     private var maskProg = 0
     private var faceMaskProg = 0
     private var compProg = 0 // multiply/softlight composite pass
+    private var multProg = 0 // fixed-function multiply composite (contour only)
     private var mixProg = 0
     private var blurProg = 0
 
@@ -55,7 +56,7 @@ class ContourMakeupEffect(private val context: Context) {
     private var uCropScaleMask = 0
     private var uEnable = 0
     private var uOpacity = 0
-    private var uStrength = 0
+    private var uIntensityMask = 0
     private var uSigmaPx = 0
     private var uMaskSize = 0
     private var uFaceWidthPx = 0
@@ -92,14 +93,37 @@ class ContourMakeupEffect(private val context: Context) {
     // Composite shader attribs/uniforms.
     private var aPosC = 0
     private var aUvC = 0
+    private var uCompCropScale = -1
     private var uCompMaskTex = 0
     private var uCompFrameTex = 0
-    private var uCompSkinRgb = 0
-    private var uCompCoolTone = 0
-    private var uCompIntensity = 0
-    private var uCompMaster = 0
-    private var uCompBlendMode = 0
+    private var uCompTexelSize = -1
+    private var uCompBaseContour = -1
+    private var uCompBaseHighlight = -1
+    private var uCompBaseMicro = -1
+    private var uCompBaseSpec = -1
+    private var uCompContourColor = -1
+    private var uCompFaceMeanY = -1
+    private var uCompFaceStdY = -1
+    private var uCompClipFrac = -1
+    private var uCompLightBias = -1
+    private var uCompCoolTone = -1
+    private var uCompJawPts = -1
+    private var uCompLipCenter = -1
+    private var uCompLipRadii = -1
+    private var uCompMouthCorners = -1
+    private var uCompFaceCenter = -1
+    private var uCompFaceWidthNdc = -1
+    private var uCompDebugMode = -1
     private var uCompUvTransform = -1
+
+    // Multiply composite shader attribs/uniforms.
+    private var aPosMul = 0
+    private var aUvMul = 0
+    private var uMulMaskTex = -1
+    private var uMulUvTransform = -1
+    private var uMulShadeRgb = -1
+    private var uMulBaseContour = -1
+    private var uMulContrastBoost = -1
 
     // Blur shader attribs/uniforms (mask-only blur).
     private var aPosB = 0
@@ -211,6 +235,7 @@ class ContourMakeupEffect(private val context: Context) {
     private var sideVisL = 1f
     private var sideVisR = 1f
     private var lowAngleTFrame = 0f
+    private var yawTFrame = 0f
 
     // Main onscreen viewport size (restored after offscreen mask passes).
     private var viewW = 1
@@ -247,16 +272,20 @@ class ContourMakeupEffect(private val context: Context) {
         try {
             // Programs.
             maskProg = linkProgram(
-                loadRawString(context, R.raw.contour_gradient_mask_vertex),
-                loadRawString(context, R.raw.contour_gradient_mask_fragment),
+                loadRawString(context, R.raw.contour_mask_vertex),
+                loadRawString(context, R.raw.contour_mask_fragment),
             )
             faceMaskProg = linkProgram(
                 loadRawString(context, R.raw.contour_face_mask_vertex),
                 loadRawString(context, R.raw.contour_face_mask_fragment),
             )
             compProg = linkProgram(
-                loadRawString(context, R.raw.contour_blend_vertex),
-                loadRawString(context, R.raw.contour_blend_fragment),
+                loadRawString(context, R.raw.contour_comp_vertex),
+                loadRawString(context, R.raw.contour_relight_fragment),
+            )
+            multProg = linkProgram(
+                loadRawString(context, R.raw.contour_comp_vertex),
+                loadRawString(context, R.raw.contour_multiply_fragment),
             )
             mixProg = linkProgram(
                 loadRawString(context, R.raw.contour_mix_vertex),
@@ -277,18 +306,19 @@ class ContourMakeupEffect(private val context: Context) {
         aUv = GLES20.glGetAttribLocation(maskProg, "aTexCoord")
         uCropScaleMask = GLES20.glGetUniformLocation(maskProg, "uCropScale")
         uEnable = GLES20.glGetUniformLocation(maskProg, "uEnable")
-        uStrength = GLES20.glGetUniformLocation(maskProg, "uStrength")
+        uOpacity = GLES20.glGetUniformLocation(maskProg, "uOpacity")
+        uIntensityMask = GLES20.glGetUniformLocation(maskProg, "uIntensity")
         uSigmaPx = GLES20.glGetUniformLocation(maskProg, "uSigmaPx")
         uMaskSize = GLES20.glGetUniformLocation(maskProg, "uMaskSize")
         uFaceWidthPx = GLES20.glGetUniformLocation(maskProg, "uFaceWidthPx")
-        uLowAngleT = GLES20.glGetUniformLocation(maskProg, "uLowAngleT")
+        uLowAngleT = GLES20.glGetUniformLocation(maskProg, "uLowAngleT") // optional
         uFaceMaskTex = GLES20.glGetUniformLocation(maskProg, "uFaceMaskTex")
         uFaceMaskSize = GLES20.glGetUniformLocation(maskProg, "uFaceMaskSize")
         uErodePx = GLES20.glGetUniformLocation(maskProg, "uErodePx")
         uMaskUvTransform = GLES20.glGetUniformLocation(maskProg, "uUvTransform")
 
         // NOTE: For uniform arrays in GLES2, always query the [0] element.
-        uCheekPts = GLES20.glGetUniformLocation(maskProg, "uCheekPath[0]")
+        uCheekPts = GLES20.glGetUniformLocation(maskProg, "uCheekPts[0]")
         uJawPts = GLES20.glGetUniformLocation(maskProg, "uJawPts[0]")
         uNoseStart = GLES20.glGetUniformLocation(maskProg, "uNoseStart[0]")
         uNoseEnd = GLES20.glGetUniformLocation(maskProg, "uNoseEnd[0]")
@@ -316,14 +346,37 @@ class ContourMakeupEffect(private val context: Context) {
         // Composite locations.
         aPosC = GLES20.glGetAttribLocation(compProg, "aPosition")
         aUvC = GLES20.glGetAttribLocation(compProg, "aTexCoord")
+        uCompCropScale = GLES20.glGetUniformLocation(compProg, "uCropScale")
         uCompMaskTex = GLES20.glGetUniformLocation(compProg, "uMaskTex")
         uCompFrameTex = GLES20.glGetUniformLocation(compProg, "uFrameTex")
-        uCompSkinRgb = GLES20.glGetUniformLocation(compProg, "uSkinRgb")
+        uCompTexelSize = GLES20.glGetUniformLocation(compProg, "uTexelSize")
+        uCompBaseContour = GLES20.glGetUniformLocation(compProg, "uBaseContour")
+        uCompBaseHighlight = GLES20.glGetUniformLocation(compProg, "uBaseHighlight")
+        uCompBaseMicro = GLES20.glGetUniformLocation(compProg, "uBaseMicro")
+        uCompBaseSpec = GLES20.glGetUniformLocation(compProg, "uBaseSpec")
+        uCompContourColor = GLES20.glGetUniformLocation(compProg, "uContourColor")
+        uCompFaceMeanY = GLES20.glGetUniformLocation(compProg, "uFaceMeanY")
+        uCompFaceStdY = GLES20.glGetUniformLocation(compProg, "uFaceStdY")
+        uCompClipFrac = GLES20.glGetUniformLocation(compProg, "uClipFrac")
+        uCompLightBias = GLES20.glGetUniformLocation(compProg, "uLightBias")
         uCompCoolTone = GLES20.glGetUniformLocation(compProg, "uCoolTone")
-        uCompIntensity = GLES20.glGetUniformLocation(compProg, "uIntensity")
-        uCompMaster = GLES20.glGetUniformLocation(compProg, "uMaster")
-        uCompBlendMode = GLES20.glGetUniformLocation(compProg, "uBlendMode")
+        uCompJawPts = GLES20.glGetUniformLocation(compProg, "uJawPts[0]")
+        uCompLipCenter = GLES20.glGetUniformLocation(compProg, "uLipCenter")
+        uCompLipRadii = GLES20.glGetUniformLocation(compProg, "uLipRadii")
+        uCompMouthCorners = GLES20.glGetUniformLocation(compProg, "uMouthCorners[0]")
+        uCompFaceCenter = GLES20.glGetUniformLocation(compProg, "uFaceCenter")
+        uCompFaceWidthNdc = GLES20.glGetUniformLocation(compProg, "uFaceWidthNdc")
+        uCompDebugMode = GLES20.glGetUniformLocation(compProg, "uDebugMode")
         uCompUvTransform = GLES20.glGetUniformLocation(compProg, "uUvTransform")
+
+        // Multiply composite locations.
+        aPosMul = GLES20.glGetAttribLocation(multProg, "aPosition")
+        aUvMul = GLES20.glGetAttribLocation(multProg, "aTexCoord")
+        uMulMaskTex = GLES20.glGetUniformLocation(multProg, "uMaskTex")
+        uMulUvTransform = GLES20.glGetUniformLocation(multProg, "uUvTransform")
+        uMulShadeRgb = GLES20.glGetUniformLocation(multProg, "uShadeRgb")
+        uMulBaseContour = GLES20.glGetUniformLocation(multProg, "uBaseContour")
+        uMulContrastBoost = GLES20.glGetUniformLocation(multProg, "uContrastBoost")
 
         // Mix locations.
         aPosM = GLES20.glGetAttribLocation(mixProg, "aPosition")
@@ -425,29 +478,36 @@ class ContourMakeupEffect(private val context: Context) {
         val pxPerNdcX = maskW.toFloat() * 0.5f
         val faceWidthPx = faceWidthNdc * pxPerNdcX
 
-        lowAngleTFrame = ContourLandmarkMapping.estimateHeadPoseMediaPipe478(landmarks).lowAngleT
+        val pose = ContourLandmarkMapping.estimateHeadPoseMediaPipe478(landmarks)
+        lowAngleTFrame = pose.lowAngleT
+        yawTFrame = pose.yawT
 
-        // 3/4-angle robustness: attenuate the far side using landmark Z (depth).
+        // 3/4-angle pose awareness (yaw):
+        // - near-side cheek/jaw should be stronger, far-side weaker
+        // - use yaw normalized to a maxYaw threshold (pose.yawT already normalizes to ~35deg)
+        //
         // uSideVis is screen-left/screen-right, so map anatomical -> screen based on mirroring.
         run {
-            val idxL = 234 // anatomical left jaw corner near ear
-            val idxR = 454 // anatomical right jaw corner near ear
-            val zL = if (idxL * 3 + 2 < landmarks.size) landmarks[idxL * 3 + 2] else 0f
-            val zR = if (idxR * 3 + 2 < landmarks.size) landmarks[idxR * 3 + 2] else 0f
-            // MediaPipe: more negative z is typically closer to camera; diff magnitude is a yaw proxy.
-            val diff = (zR - zL).coerceIn(-0.20f, 0.20f)
-            val t = (abs(diff) / 0.060f).coerceIn(0f, 1f)
-            val far = (1.0f - 0.42f * t).coerceIn(0.55f, 1.0f)
-            val near = 1.0f
-            val anatLeftNear = (diff > 0f) // right further => left is nearer
-            val anatL = if (anatLeftNear) near else far
-            val anatR = if (anatLeftNear) far else near
-            if (isMirrored) {
-                sideVisL = anatR
-                sideVisR = anatL
+            val yawNorm = yawTFrame.coerceIn(0f, 1f)
+            val nearBoost = 0.55f
+            val nearMul = (1.0f + yawNorm * nearBoost)
+            val farMul = (1.0f - yawNorm * nearBoost).coerceAtLeast(0.15f)
+
+            // pose.yawRad sign matches jRz-jLz: positive => anatomical LEFT is nearer.
+            val anatLeftNear = pose.yawRad > 0f
+            val anatL = if (anatLeftNear) nearMul else farMul
+            val anatR = if (anatLeftNear) farMul else nearMul
+
+            val targetScreenL = if (isMirrored) anatR else anatL
+            val targetScreenR = if (isMirrored) anatL else anatR
+
+            // EMA smooth to prevent far/near pumping under jittery Z.
+            if (!hasPrev) {
+                sideVisL = targetScreenL
+                sideVisR = targetScreenR
             } else {
-                sideVisL = anatL
-                sideVisR = anatR
+                sideVisL += (targetScreenL - sideVisL) * a
+                sideVisR += (targetScreenR - sideVisR) * a
             }
         }
 
@@ -513,13 +573,15 @@ class ContourMakeupEffect(private val context: Context) {
 
         // Face size scaling -> blur radius in pixels.
         // Heavy feather is the key to premium contour (TikTok/Snap look).
-        val blurRadiusPx = (faceWidthPx * 0.040f).coerceIn(
-            faceWidthPx * 0.025f,
-            min(faceWidthPx * 0.060f, min(maskW, maskH) * 0.18f),
+        // Feather/falloff control:
+        // keep proportional to face size, but avoid over-blur that erases the shadow read.
+        val blurRadiusPx = (faceWidthPx * 0.020f).coerceIn(
+            faceWidthPx * 0.013f,
+            min(faceWidthPx * 0.035f, min(maskW, maskH) * 0.11f),
         )
         val softnessK = params.softness.coerceIn(0f, 1f)
         // Softness is a gentle multiplier only (avoid "double blur" look).
-        val sigmaPx = blurRadiusPx * (0.88f + 0.42f * softnessK)
+        val sigmaPx = blurRadiusPx * (0.78f + 0.32f * softnessK)
 
         // Face clip mask erosion in pixels: faceWidthPx * 0.01f (tunable).
         val erosionPx = (faceWidthPx * params.faceErosionScale.coerceIn(0.0f, 0.05f))
@@ -543,12 +605,9 @@ class ContourMakeupEffect(private val context: Context) {
             erosionPx = erosionPx,
         )
 
-        // Mask-only blur (separable). Run 2 iterations to kill blotches/banding.
-        // temp -> outTex (H), outTex -> temp (V), then repeat.
-        repeat(2) {
-            blurMask(outTex = outTex, inTex = maskTexTmp, dirX = 1f, dirY = 0f)
-            blurMask(outTex = maskTexTmp, inTex = outTex, dirX = 0f, dirY = 1f)
-        }
+        // Mask-only blur (separable). Keep moderate to preserve sculpt definition.
+        blurMask(outTex = outTex, inTex = maskTexTmp, dirX = 1f, dirY = 0f)
+        blurMask(outTex = maskTexTmp, inTex = outTex, dirX = 0f, dirY = 1f)
 
         // Temporal stabilization (EMA) on the *blurred packed mask*.
         // outTex = lerp(prevTex, maskTexTmp, t)
@@ -597,22 +656,35 @@ class ContourMakeupEffect(private val context: Context) {
         GLES20.glEnableVertexAttribArray(aUvC)
         GLES20.glVertexAttribPointer(aUvC, 2, GLES20.GL_FLOAT, false, 4 * 4, 2 * 4)
 
-        // Per-region intensities already include adaptive tuning (passed by ContourRenderer).
-        GLES20.glUniform4f(
-            uCompIntensity,
-            params.cheekContour.coerceIn(0f, 1f),
-            params.jawContour.coerceIn(0f, 1f),
-            params.noseContour.coerceIn(0f, 1f),
-            params.chinContour.coerceIn(0f, 1f),
-        )
-        GLES20.glUniform1f(uCompMaster, params.intensity.coerceIn(0f, 1f))
-        GLES20.glUniform1f(uCompCoolTone, params.coolTone.coerceIn(0f, 1f))
-        GLES20.glUniform1f(uCompBlendMode, if (params.blendMode == ContourBlendMode.SOFT_LIGHT) 1f else 0f)
+        if (uCompCropScale >= 0) {
+            GLES20.glUniform2f(uCompCropScale, cropScaleX, cropScaleY)
+        }
+        if (uCompTexelSize >= 0) {
+            GLES20.glUniform2f(uCompTexelSize, frameTexelSizeX, frameTexelSizeY)
+        }
+        if (uCompBaseContour >= 0) GLES20.glUniform1f(uCompBaseContour, baseContour.coerceIn(0f, 1f))
+        if (uCompBaseHighlight >= 0) GLES20.glUniform1f(uCompBaseHighlight, baseHighlight.coerceIn(0f, 1f))
+        if (uCompBaseMicro >= 0) GLES20.glUniform1f(uCompBaseMicro, baseMicro.coerceIn(0f, 1f))
+        if (uCompBaseSpec >= 0) GLES20.glUniform1f(uCompBaseSpec, baseSpec.coerceIn(0f, 1f))
+        if (uCompContourColor >= 0) {
+            GLES20.glUniform3f(uCompContourColor, params.shade.red, params.shade.green, params.shade.blue)
+        }
+        if (uCompCoolTone >= 0) GLES20.glUniform1f(uCompCoolTone, params.coolTone.coerceIn(0f, 1f))
+        if (uCompFaceMeanY >= 0) GLES20.glUniform1f(uCompFaceMeanY, faceMeanY.coerceIn(0f, 1f))
+        if (uCompFaceStdY >= 0) GLES20.glUniform1f(uCompFaceStdY, faceStdY.coerceIn(0f, 1f))
+        if (uCompClipFrac >= 0) GLES20.glUniform1f(uCompClipFrac, clipFrac.coerceIn(0f, 1f))
+        if (uCompLightBias >= 0) GLES20.glUniform1f(uCompLightBias, lightBias.coerceIn(0f, 1f))
+
+        if (uCompJawPts >= 0) GLES20.glUniform2fv(uCompJawPts, JAW_COUNT, jawPtsSm, 0)
+        if (uCompLipCenter >= 0) GLES20.glUniform2f(uCompLipCenter, lipCenterSm[0], lipCenterSm[1])
+        if (uCompLipRadii >= 0) GLES20.glUniform2f(uCompLipRadii, lipRadiiSm[0], lipRadiiSm[1])
+        if (uCompMouthCorners >= 0) GLES20.glUniform2fv(uCompMouthCorners, 2, mouthCornersSm, 0)
+        if (uCompFaceCenter >= 0) GLES20.glUniform2f(uCompFaceCenter, faceCenterSm[0], faceCenterSm[1])
+        if (uCompFaceWidthNdc >= 0) GLES20.glUniform1f(uCompFaceWidthNdc, faceWidthNdcSm.coerceIn(0.10f, 2.0f))
+        if (uCompDebugMode >= 0) GLES20.glUniform1f(uCompDebugMode, 0f)
         if (uCompUvTransform >= 0) {
             GLES20.glUniformMatrix3fv(uCompUvTransform, 1, false, uvTransform, 0)
         }
-        // Skin sample drives shade in shader; shade uniform kept for future extension.
-        GLES20.glUniform3f(uCompSkinRgb, params.shade.red, params.shade.green, params.shade.blue)
 
         // Mask texture.
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
@@ -630,6 +702,61 @@ class ContourMakeupEffect(private val context: Context) {
 
         GLES20.glDisableVertexAttribArray(aPosC)
         GLES20.glDisableVertexAttribArray(aUvC)
+    }
+
+    /**
+     * Apply contour to the currently bound framebuffer using a true multiply/darken blend.
+     *
+     * Blending:
+     * - glBlendFunc(GL_DST_COLOR, GL_ZERO)
+     * - output is a per-pixel factor in RGB (1 = no change)
+     */
+    fun applyContourMultiply(
+        maskTexture: Int,
+        shade: Color,
+        baseContour: Float,
+        contrastBoost: Float,
+    ) {
+        if (maskTexture == 0) return
+        if (!ready || multProg == 0) return
+
+        GLES20.glUseProgram(multProg)
+
+        // Quad.
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, quadVbo)
+        GLES20.glEnableVertexAttribArray(aPosMul)
+        GLES20.glVertexAttribPointer(aPosMul, 2, GLES20.GL_FLOAT, false, 4 * 4, 0)
+        GLES20.glEnableVertexAttribArray(aUvMul)
+        GLES20.glVertexAttribPointer(aUvMul, 2, GLES20.GL_FLOAT, false, 4 * 4, 2 * 4)
+
+        if (uMulUvTransform >= 0) {
+            GLES20.glUniformMatrix3fv(uMulUvTransform, 1, false, uvTransform, 0)
+        }
+        if (uMulShadeRgb >= 0) {
+            GLES20.glUniform3f(uMulShadeRgb, shade.red, shade.green, shade.blue)
+        }
+        if (uMulBaseContour >= 0) {
+            GLES20.glUniform1f(uMulBaseContour, baseContour.coerceIn(0f, 1f))
+        }
+        if (uMulContrastBoost >= 0) {
+            GLES20.glUniform1f(uMulContrastBoost, contrastBoost.coerceIn(0f, 2.0f))
+        }
+
+        // Mask texture.
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTexture)
+        GLES20.glUniform1i(uMulMaskTex, 1)
+
+        // True multiply/darken.
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_DST_COLOR, GLES20.GL_ZERO)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        // Restore default blend for subsequent layers.
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+
+        GLES20.glDisableVertexAttribArray(aPosMul)
+        GLES20.glDisableVertexAttribArray(aUvMul)
     }
 
     // ── Internal: mask rendering ─────────────────────────────────────────────
@@ -664,15 +791,20 @@ class ContourMakeupEffect(private val context: Context) {
             if (params.cheekContour > 0.001f) 1f else 0f,
             if (params.jawContour > 0.001f) 1f else 0f,
             if (params.noseContour > 0.001f) 1f else 0f,
-            if (params.chinContour > 0.001f) 1f else 0f,
+            if (params.foreheadContour > 0.001f) 1f else 0f,
         )
-        GLES20.glUniform4f(
-            uStrength,
-            1.0f, // keep mask normalized; strengths applied in composite
-            1.0f,
-            1.0f,
-            1.0f,
-        )
+        if (uOpacity >= 0) {
+            GLES20.glUniform4f(
+                uOpacity,
+                params.cheekContour.coerceIn(0f, 1f),
+                params.jawContour.coerceIn(0f, 1f),
+                params.noseContour.coerceIn(0f, 1f),
+                params.foreheadContour.coerceIn(0f, 1f),
+            )
+        }
+        if (uIntensityMask >= 0) {
+            GLES20.glUniform1f(uIntensityMask, params.intensity.coerceIn(0f, 1f))
+        }
         GLES20.glUniform1f(uSigmaPx, sigmaPx.coerceIn(0.5f, 128f))
         GLES20.glUniform2f(uMaskSize, maskW.toFloat(), maskH.toFloat())
         GLES20.glUniform1f(uFaceWidthPx, faceWidthPx.coerceIn(1.0f, 4096f))
@@ -694,7 +826,8 @@ class ContourMakeupEffect(private val context: Context) {
         GLES20.glUniform2fv(uForeheadPts, FOREHEAD_COUNT, foreheadPtsSm, 0)
         GLES20.glUniform2f(uFaceCenter, faceCenterSm[0], faceCenterSm[1])
         if (uSideVis >= 0) {
-            GLES20.glUniform2f(uSideVis, sideVisL.coerceIn(0f, 1f), sideVisR.coerceIn(0f, 1f))
+            // Allow slight near-side boost on 3/4 poses (final mask clamps later).
+            GLES20.glUniform2f(uSideVis, sideVisL.coerceIn(0f, 1.6f), sideVisR.coerceIn(0f, 1.6f))
         }
 
         GLES20.glUniform2fv(uEyeCenter, 2, eyeCenterSm, 0)

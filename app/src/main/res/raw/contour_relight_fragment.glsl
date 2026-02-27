@@ -3,6 +3,7 @@ precision mediump float;
 uniform sampler2D uFrameTex; // base frame (camera + foundation/concealer already applied)
 uniform sampler2D uMaskTex;  // packed low-res mask (RGBA: contourCore, contourBlend, highlightCore, highlightBlend)
 uniform vec2 uTexelSize;     // full-res texel size for micro-contrast taps
+uniform mat3 uUvTransform;   // shared UV transform (identity unless overridden)
 
 uniform float uBaseContour;   // user/style base (0..1)
 uniform float uBaseHighlight; // user/style base (0..1)
@@ -161,8 +162,11 @@ float bilateralBaseLuma(vec2 uv, vec3 centerRgb) {
 }
 
 void main() {
-    vec3 rgb = texture2D(uFrameTex, vTexCoord).rgb;
-    vec4 m = texture2D(uMaskTex, vTexCoord);
+    vec2 uv = (uUvTransform * vec3(vTexCoord, 1.0)).xy;
+    uv = clamp(uv, vec2(0.0), vec2(1.0));
+
+    vec3 rgb = texture2D(uFrameTex, uv).rgb;
+    vec4 m = texture2D(uMaskTex, uv);
 
     float contourCore = m.r;
     float contourBlend = m.g;
@@ -170,7 +174,7 @@ void main() {
     float highlightBlend = m.a;
 
     float Y = luma(rgb);
-    float Ybase = bilateralBaseLuma(vTexCoord, rgb);
+    float Ybase = bilateralBaseLuma(uv, rgb);
     float detail = Y - Ybase;
 
     // Lighting-aware strength auto-tuning.
@@ -265,10 +269,10 @@ void main() {
     float mn = min(rgb.r, min(rgb.g, rgb.b));
     float sat = mx - mn;
     // Simple local high-frequency estimate.
-    vec3 rx1 = texture2D(uFrameTex, vTexCoord + vec2(uTexelSize.x, 0.0)).rgb;
-    vec3 rx2 = texture2D(uFrameTex, vTexCoord - vec2(uTexelSize.x, 0.0)).rgb;
-    vec3 ry1 = texture2D(uFrameTex, vTexCoord + vec2(0.0, uTexelSize.y)).rgb;
-    vec3 ry2 = texture2D(uFrameTex, vTexCoord - vec2(0.0, uTexelSize.y)).rgb;
+    vec3 rx1 = texture2D(uFrameTex, uv + vec2(uTexelSize.x, 0.0)).rgb;
+    vec3 rx2 = texture2D(uFrameTex, uv - vec2(uTexelSize.x, 0.0)).rgb;
+    vec3 ry1 = texture2D(uFrameTex, uv + vec2(0.0, uTexelSize.y)).rgb;
+    vec3 ry2 = texture2D(uFrameTex, uv - vec2(0.0, uTexelSize.y)).rgb;
     float Yblur = (Y + luma(rx1) + luma(rx2) + luma(ry1) + luma(ry2)) * 0.2;
     float hf = abs(Y - Yblur);
 

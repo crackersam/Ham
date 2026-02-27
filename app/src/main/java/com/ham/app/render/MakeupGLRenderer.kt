@@ -100,6 +100,8 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var foundUAutoCorrect = -1
     private var foundUAutoThreshold = -1
     private var foundUAutoRadiusScale = -1
+    private var foundUContourMaskTex = -1
+    private var foundUContourSmoothReduce = -1
     private var foundUMirror = 0
     private var foundUCropScale = 0
 
@@ -312,6 +314,8 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         foundUAutoCorrect = GLES20.glGetUniformLocation(foundProg, "uAutoCorrect")
         foundUAutoThreshold = GLES20.glGetUniformLocation(foundProg, "uAutoThreshold")
         foundUAutoRadiusScale = GLES20.glGetUniformLocation(foundProg, "uAutoRadiusScale")
+        foundUContourMaskTex = GLES20.glGetUniformLocation(foundProg, "uContourMaskTex")
+        foundUContourSmoothReduce = GLES20.glGetUniformLocation(foundProg, "uContourSmoothReduce")
         foundUMirror      = GLES20.glGetUniformLocation(foundProg,  "uMirror")
         foundUCropScale   = GLES20.glGetUniformLocation(foundProg,  "uCropScale")
 
@@ -405,6 +409,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         val lm = packet?.landmarks ?: latestLandmarks.get()
         val hasAnyLayer =
             autoCorrectStrength > 0.01f ||
+            smoothIntensity > 0.01f ||
             style.foundationAlpha > 0.01f ||
                 style.concealerLift > 0.01f ||
                 style.concealerNeutralize > 0.01f ||
@@ -417,39 +422,46 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 style.browAlpha > 0.01f ||
                 style.browFillAlpha > 0.01f ||
                 style.lashAlpha > 0.01f
-        val shouldRelightContourHighlight =
-            (lm != null && (style.contourAlpha > 0.01f || style.highlightAlpha > 0.01f))
+        val shouldBuildContourMask =
+            (lm != null && style.contourAlpha > 0.01f && contourRenderer.isReady())
 
         if (lm != null && hasAnyLayer) {
-            if (shouldRelightContourHighlight && baseFbo != 0 && baseTex != 0 && contourRenderer.isReady()) {
-                // Offscreen base (camera + foundation/concealer) → onscreen relighting contour → overlays.
-                renderCameraToBaseFbo(scaleX, scaleY)
-                drawBaseFacePasses(lm, style, scaleX, scaleY)
-
-                // Now draw relit base to the screen.
-                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
-                GLES20.glViewport(0, 0, viewWidth, viewHeight)
-                // Do NOT clear here: the contour relight pass overwrites the full frame.
-                // Clearing first risks a black preview if contour fails (e.g., shader compile/link issue).
-                val ok = drawContourRelightToScreen(lm, style, scaleX, scaleY)
-                if (ok) {
-                    drawMakeupOverlays(lm, style, scaleX, scaleY, allowLegacyHighlight = false)
-                } else {
-                    // Fail-safe fallback: render the normal pipeline to screen.
-                    GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-                    renderCameraToScreen(scaleX, scaleY)
-                    drawBaseFacePasses(lm, style, scaleX, scaleY)
-                    drawMakeupOverlays(lm, style, scaleX, scaleY, allowLegacyHighlight = false)
-                }
+            // Build contour mask first (for mask-aware smoothing + contour multiply).
+            val builtContour = if (shouldBuildContourMask) {
+                val skinBase = skinTintEma ?: effectiveFoundationTint(style)
+                contourRenderer.buildMask(
+                    lm = lm,
+                    isMirrored = isMirrored,
+                    style = style,
+                    skinBase = skinBase,
+                    lighting = ContourRenderer.LightingMetrics(
+                        faceMeanY = faceMeanYEma,
+                        faceStdY = faceStdYEma,
+                        clipFrac = clipFracEma,
+                        lightBias = lightBiasEma,
+                    ),
+                    nowNs = System.nanoTime(),
+                )
             } else {
-                // Standard pipeline: camera + base passes + overlays directly to screen.
-                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
-                GLES20.glViewport(0, 0, viewWidth, viewHeight)
-                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-                renderCameraToScreen(scaleX, scaleY)
-                drawBaseFacePasses(lm, style, scaleX, scaleY)
-                drawMakeupOverlays(lm, style, scaleX, scaleY, allowLegacyHighlight = false)
+                null
             }
+
+            // Standard pipeline: camera + base passes + contour multiply + overlays directly to screen.
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            GLES20.glViewport(0, 0, viewWidth, viewHeight)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+            renderCameraToScreen(scaleX, scaleY)
+            drawBaseFacePasses(lm, style, scaleX, scaleY, contourMaskTex = builtContour?.maskTex ?: 0)
+
+            if (builtContour != null) {
+                contourRenderer.applyContourMultiply(
+                    built = builtContour,
+                    contrastBoost = 1.65f,
+                )
+            }
+
+            // Use legacy highlight overlay since contour relight is no longer used.
+            drawMakeupOverlays(lm, style, scaleX, scaleY, allowLegacyHighlight = true)
         } else {
             // No landmarks or no active layers: just draw the camera frame.
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
@@ -626,7 +638,13 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
     // Makeup drawing
     // ─────────────────────────────────────────────────────────────────────────
 
-    private fun drawBaseFacePasses(lm: FloatArray, style: MakeupStyle, cropScaleX: Float, cropScaleY: Float) {
+    private fun drawBaseFacePasses(
+        lm: FloatArray,
+        style: MakeupStyle,
+        cropScaleX: Float,
+        cropScaleY: Float,
+        contourMaskTex: Int,
+    ) {
         GLES20.glEnable(GLES20.GL_BLEND)
 
         val mirror = isMirrored
@@ -645,7 +663,9 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
         // Samples the camera texture within the face-oval mesh boundary,
         // applying skin-smoothing and warmth correction only where the face is.
         val shouldDrawFoundation =
-            style.foundationAlpha > 0.01f || autoCorrectStrength > 0.01f
+            style.foundationAlpha > 0.01f ||
+                autoCorrectStrength > 0.01f ||
+                smoothIntensity > 0.01f
         if (shouldDrawFoundation) {
             GLES20.glUseProgram(foundProg)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -660,7 +680,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             // when foundationAlpha is 0, we still run dark-patch correction but avoid
             // re-applying tone/smoothing (prevents “double warmth” and unwanted blur).
             val foundationEnabled = style.foundationAlpha > 0.01f
-            GLES20.glUniform1f(foundUSmooth, if (foundationEnabled) smoothIntensity else 0f)
+            GLES20.glUniform1f(foundUSmooth, smoothIntensity)
             GLES20.glUniform1f(foundUTone, if (foundationEnabled) toneIntensity else 0f)
             GLES20.glUniform1f(foundUFoundAlpha, style.foundationAlpha)
             if (foundUAutoCorrect >= 0) {
@@ -683,6 +703,17 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             }
             if (foundUFoundCoverage >= 0) {
                 GLES20.glUniform1f(foundUFoundCoverage, style.foundationCoverage.coerceIn(0f, 1f))
+            }
+
+            // Contour mask-aware smoothing (optional).
+            if (foundUContourMaskTex >= 0) {
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE2)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, contourMaskTex)
+                GLES20.glUniform1i(foundUContourMaskTex, 2)
+            }
+            if (foundUContourSmoothReduce >= 0) {
+                val reduce = if (contourMaskTex != 0) 0.35f else 0f
+                GLES20.glUniform1f(foundUContourSmoothReduce, reduce)
             }
 
             drawFoundation(MakeupGeometry.buildFanMesh(lm, FACE_OVAL, mirror, aspectScale))
@@ -724,6 +755,11 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             }
             if (foundUConcealNeutralize >= 0) {
                 GLES20.glUniform1f(foundUConcealNeutralize, style.concealerNeutralize.coerceIn(0f, 1f))
+            }
+
+            // Disable contour-smoothing reduction for concealer-only draws.
+            if (foundUContourSmoothReduce >= 0) {
+                GLES20.glUniform1f(foundUContourSmoothReduce, 0f)
             }
 
             drawFoundation(
@@ -1039,7 +1075,7 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
             GLES20.glUniform1f(mkUGradientDir, 0f)
             GLES20.glUniform1f(mkUEffectKind, 1f)
             // Lower noise: the shader uses it mostly as micro-dither now (cleaner, more pro finish).
-            GLES20.glUniform1f(mkUNoiseAmount, 0.085f)
+            GLES20.glUniform1f(mkUNoiseAmount, 0.070f)
 
             fun drawBlush(p: BlushPose, radiusScale: Float, alphaScale: Float) {
                 // More "swept" shape: longer along cheekbone, tighter vertically.
@@ -1061,13 +1097,13 @@ class MakeupGLRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 )
             }
 
-            // Main pass (soft-light shader path is more subtle than flat paint, so keep alpha modestly higher).
-            drawBlush(lPose, radiusScale = 1.00f, alphaScale = 0.74f)
-            drawBlush(rPose, radiusScale = 1.00f, alphaScale = 0.74f)
+            // Main pass (balanced for bridal glow so it doesn’t fight cheek highlight).
+            drawBlush(lPose, radiusScale = 1.00f, alphaScale = 0.68f)
+            drawBlush(rPose, radiusScale = 1.00f, alphaScale = 0.68f)
 
             // Second softer pass for depth
-            drawBlush(lPose, radiusScale = 1.48f, alphaScale = 0.34f)
-            drawBlush(rPose, radiusScale = 1.48f, alphaScale = 0.34f)
+            drawBlush(lPose, radiusScale = 1.55f, alphaScale = 0.28f)
+            drawBlush(rPose, radiusScale = 1.55f, alphaScale = 0.28f)
 
             // Reset defaults for subsequent layers.
             GLES20.glUniform1f(mkUEffectKind, 0f)

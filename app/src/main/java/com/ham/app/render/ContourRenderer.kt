@@ -15,6 +15,27 @@ import kotlin.math.min
 class ContourRenderer(context: Context) {
     private val effect = ContourMakeupEffect(context)
 
+    /**
+     * User-tunable controls (0..1):
+     * - [contourIntensity] is a global multiplier (in addition to style.contourAlpha)
+     * - per-region multipliers control relative placement emphasis
+     *
+     * Defaults match the requested starting point.
+     */
+    var contourIntensity: Float = 1.0f
+    var cheekMultiplier: Float = 0.48f
+    var jawMultiplier: Float = 0.34f
+    var templeMultiplier: Float = 0.28f
+    var noseMultiplier: Float = 0.18f
+
+    // EMA smoothing for per-frame computed strengths (prevents pumping).
+    private var hasStrengthEma = false
+    private var cheekEma = 0f
+    private var jawEma = 0f
+    private var noseEma = 0f
+    private var foreheadEma = 0f
+    private var baseContourEma = 0f
+
     fun isReady(): Boolean = effect.isReady()
 
     fun onSurfaceCreated() {
@@ -41,11 +62,20 @@ class ContourRenderer(context: Context) {
     )
 
     data class Strengths(
-        val master: Float,
         val cheek: Float,
         val jaw: Float,
         val nose: Float,
-        val chin: Float,
+        val forehead: Float,
+        val baseContour: Float,
+        val baseHighlight: Float,
+        val baseMicro: Float,
+        val baseSpec: Float,
+    )
+
+    data class BuiltContour(
+        val maskTex: Int,
+        val shade: Color,
+        val baseContour: Float,
     )
 
     /**
@@ -88,27 +118,67 @@ class ContourRenderer(context: Context) {
             (1.0f - kotlin.math.abs(x - 0.5f) / 0.22f).coerceIn(0f, 1f)
         }
 
-        // Requested visible intensities (TikTok-level) as the base.
-        // Pose adjusts these:
-        // - low angle: cheek higher/stronger, jaw + chin stronger
-        // - high angle: jaw softer, cheek emphasized
-        val cheekBase = 0.60f
-        val jawBase = 0.50f
-        val chinBase = 0.50f
-        val noseBase = 0.40f
+        // Region multipliers:
+        // Keep these in the "reads as sculpt, not paint" range.
+        val cheekBase = cheekMultiplier.coerceIn(0f, 1f)
+        val jawBase = jawMultiplier.coerceIn(0f, 1f)
+        // Temples / hairline.
+        val foreheadBase = templeMultiplier.coerceIn(0f, 1f)
+        val noseBase = noseMultiplier.coerceIn(0f, 1f)
 
         val cheekPose = (1.0f + 0.20f * lowAngleT + 0.12f * highAngleT).coerceIn(0.75f, 1.45f)
         val jawPose = (1.0f + 0.30f * lowAngleT - 0.35f * highAngleT).coerceIn(0.55f, 1.55f)
-        val chinPose = (1.0f + 0.55f * lowAngleT - 0.25f * highAngleT).coerceIn(0.55f, 1.80f)
-        val nosePose = (0.55f + 0.45f * noseCenterT).coerceIn(0.55f, 1.0f) * (1.0f - 0.70f * yawT).coerceIn(0.25f, 1.0f)
+        val foreheadPose = (1.0f + 0.10f * lowAngleT + 0.08f * highAngleT).coerceIn(0.70f, 1.25f)
+        // Nose contour must fade in profile to avoid artifacts.
+        val noseYawMul = (1.0f - 0.85f * yawT).coerceAtLeast(0.10f)
+        val nosePose =
+            (0.55f + 0.45f * noseCenterT).coerceIn(0.55f, 1.0f) *
+                noseYawMul
+
+        // Map style alphas into the relight shader's base strengths.
+        // These are intentionally stronger than the raw style alpha so the result reads on-device,
+        // while the relight shader itself suppresses harshness in already-shadowed areas.
+        val baseContour =
+            (style.contourAlpha.coerceIn(0f, 1f) *
+                contourIntensity.coerceIn(0f, 1f) *
+                7.4f * faceBoost * lowLightSoft).coerceIn(0f, 1.0f)
+        val baseHighlight =
+            (style.highlightAlpha.coerceIn(0f, 1f) * 4.2f * faceBoost * lowLightSoft).coerceIn(0f, 1.0f)
+        // Micro-contrast + spec are subtle “pro finish” touches, strongest when highlight is enabled.
+        val baseMicro = (baseContour * 0.22f).coerceIn(0f, 0.35f)
+        val baseSpec = (baseHighlight * 0.20f).coerceIn(0f, 0.35f)
+
+        val cheek0 = (cheekBase * cheekPose * faceBoost * lowLightSoft).coerceIn(0f, 1.0f)
+        val jaw0 = (jawBase * jawPose * faceBoost * lowLightSoft).coerceIn(0f, 1.0f)
+        val nose0 = (noseBase * nosePose * faceBoost * lowLightSoft).coerceIn(0f, 1.0f)
+        val forehead0 = (foreheadBase * foreheadPose * faceBoost * lowLightSoft).coerceIn(0f, 1.0f)
+
+        // EMA (stable per-region intensity).
+        val emaA = 0.10f
+        if (!hasStrengthEma) {
+            cheekEma = cheek0
+            jawEma = jaw0
+            noseEma = nose0
+            foreheadEma = forehead0
+            baseContourEma = baseContour
+            hasStrengthEma = true
+        } else {
+            cheekEma += (cheek0 - cheekEma) * emaA
+            jawEma += (jaw0 - jawEma) * emaA
+            noseEma += (nose0 - noseEma) * emaA
+            foreheadEma += (forehead0 - foreheadEma) * emaA
+            baseContourEma += (baseContour - baseContourEma) * emaA
+        }
 
         return Strengths(
-            // Style master. Most styles use small contourAlpha; upscale to reach visible sculpting.
-            master = (style.contourAlpha.coerceIn(0f, 1f) * 5.0f * faceBoost * lowLightSoft).coerceIn(0f, 1.0f),
-            cheek = (cheekBase * cheekPose * faceBoost * lowLightSoft).coerceIn(0f, 1.0f),
-            jaw = (jawBase * jawPose * faceBoost * lowLightSoft).coerceIn(0f, 1.0f),
-            nose = (noseBase * nosePose * faceBoost * lowLightSoft).coerceIn(0f, 1.0f),
-            chin = (chinBase * chinPose * faceBoost * lowLightSoft).coerceIn(0f, 1.0f),
+            cheek = cheekEma.coerceIn(0f, 1.0f),
+            jaw = jawEma.coerceIn(0f, 1.0f),
+            nose = noseEma.coerceIn(0f, 1.0f),
+            forehead = foreheadEma.coerceIn(0f, 1.0f),
+            baseContour = baseContourEma.coerceIn(0f, 1.0f),
+            baseHighlight = baseHighlight,
+            baseMicro = baseMicro,
+            baseSpec = baseSpec,
         )
     }
 
@@ -117,15 +187,33 @@ class ContourRenderer(context: Context) {
      * contourColor = skinColor * 0.7, with a slightly reduced red channel.
      */
     fun computeContourShade(skin: Color): Pair<Color, Float> {
-        val k = 0.70f
+        // Cool-toned, slightly desaturated shadow tint:
+        // - avoids orange/brown "dirt" read
+        // - stays conservative to prevent muddy skin, especially in low light
+        fun luma(c: Color) = c.red * 0.2126f + c.green * 0.7152f + c.blue * 0.0722f
+        fun mix(a: Float, b: Float, t0: Float): Float {
+            val t = t0.coerceIn(0f, 1f)
+            return a + (b - a) * t
+        }
+
+        val y = luma(skin).coerceIn(0f, 1f)
+        val desatT = 0.28f
+        val sdR = mix(skin.red, y, desatT)
+        val sdG = mix(skin.green, y, desatT)
+        val sdB = mix(skin.blue, y, desatT)
+
+        // Factor color (multiplied into the already-smoothed base):
+        // keep it closer to 1 than previous (less muddy), and cool it slightly.
+        val k = 0.74f
         val shade = Color(
-            red = (skin.red * k * 0.94f).coerceIn(0.02f, 0.98f),
-            green = (skin.green * k).coerceIn(0.02f, 0.98f),
-            blue = (skin.blue * k).coerceIn(0.02f, 0.98f),
+            red = (sdR * k * 0.90f).coerceIn(0.10f, 0.98f),
+            green = (sdG * k * 0.99f).coerceIn(0.10f, 0.98f),
+            blue = (sdB * k * 1.04f).coerceIn(0.10f, 0.98f),
             alpha = 1f,
         )
-        // Keep a small coolTone bias for cross-device stability (used very lightly in shader).
-        return Pair(shade, 0.65f)
+
+        // Shader uses this very lightly; keep moderate.
+        return Pair(shade, 0.66f)
     }
 
     fun renderToScreen(
@@ -140,7 +228,7 @@ class ContourRenderer(context: Context) {
         nowNs: Long,
     ): Boolean {
         if (!effect.isReady()) return false
-        if (style.contourAlpha <= 0.01f) return false
+        if (style.contourAlpha <= 0.01f && style.highlightAlpha <= 0.01f) return false
 
         val (shade, coolTone) = computeContourShade(skinBase)
         val strengths = computeStrengths(lm, style, lighting)
@@ -148,11 +236,12 @@ class ContourRenderer(context: Context) {
         val params = ContourParams(
             shade = shade,
             coolTone = coolTone,
-            intensity = strengths.master.coerceIn(0f, 1f),
+            // Keep the packed mask normalized; final intensity is controlled by the relight shader bases.
+            intensity = 1.0f,
             cheekContour = strengths.cheek,
             jawContour = strengths.jaw,
             noseContour = strengths.nose,
-            chinContour = strengths.chin,
+            foreheadContour = strengths.forehead,
             softness = 1.0f,
             faceErosionScale = 0.01f,
             // Soft-light reads more like “pro” sculpt (TikTok/Snap) than pure multiply.
@@ -175,10 +264,10 @@ class ContourRenderer(context: Context) {
             frameTexture = frameTexture,
             maskTexture = maskTex,
             params = params,
-            baseContour = 1f,
-            baseHighlight = 0f,
-            baseMicro = 0f,
-            baseSpec = 0f,
+            baseContour = strengths.baseContour,
+            baseHighlight = strengths.baseHighlight,
+            baseMicro = strengths.baseMicro,
+            baseSpec = strengths.baseSpec,
             faceMeanY = lighting.faceMeanY,
             faceStdY = lighting.faceStdY,
             clipFrac = lighting.clipFrac,
@@ -188,6 +277,70 @@ class ContourRenderer(context: Context) {
         )
 
         return true
+    }
+
+    /**
+     * Build and return a contour mask for this frame (GPU).
+     *
+     * The returned [BuiltContour.maskTex] can be reused by:
+     * - the multiply contour composite pass
+     * - mask-aware smoothing in the foundation shader
+     */
+    fun buildMask(
+        lm: FloatArray,
+        isMirrored: Boolean,
+        style: com.ham.app.data.MakeupStyle,
+        skinBase: Color,
+        lighting: LightingMetrics,
+        nowNs: Long,
+    ): BuiltContour? {
+        if (!effect.isReady()) return null
+        if (style.contourAlpha <= 0.01f) return null
+
+        val (shade, coolTone) = computeContourShade(skinBase)
+        val strengths = computeStrengths(lm, style, lighting)
+
+        val params = ContourParams(
+            shade = shade,
+            coolTone = coolTone,
+            intensity = 1.0f,
+            cheekContour = strengths.cheek,
+            jawContour = strengths.jaw,
+            noseContour = strengths.nose,
+            foreheadContour = strengths.forehead,
+            softness = 1.0f,
+            faceErosionScale = 0.01f,
+            blendMode = ContourBlendMode.SOFT_LIGHT,
+            landmarkSmoothingT = 0.20f,
+            temporalSmoothing = 0.60f,
+        )
+
+        val maskTex = effect.buildContourMask(
+            landmarks = lm,
+            faceRect = null,
+            params = params,
+            isMirrored = isMirrored,
+            nowNs = nowNs,
+        )
+        if (maskTex == 0) return null
+
+        return BuiltContour(
+            maskTex = maskTex,
+            shade = shade,
+            baseContour = strengths.baseContour,
+        )
+    }
+
+    fun applyContourMultiply(
+        built: BuiltContour,
+        contrastBoost: Float,
+    ) {
+        effect.applyContourMultiply(
+            maskTexture = built.maskTex,
+            shade = built.shade,
+            baseContour = built.baseContour,
+            contrastBoost = contrastBoost,
+        )
     }
 }
 
